@@ -1,23 +1,19 @@
 import multiprocessing as mp
 import random
 import time
-from typing import Iterator
 
 
 class Message:
     def __init__(self, data, ts=-1):
         self.data = data
-        # set to current time if negative or not provided
         self.ts = ts if ts >= 0 else int(time.time() * 1e9)
 
 
-# --- Emitter and Receiver ---
 class Emitter:
     def __init__(self):
-        self._queue = None  # will be set by World.connect
+        self._queue = None
 
     def _bind(self, queue: mp.Queue):
-        """Bind to a communication channel created by the World."""
         self._queue = queue
 
     def emit(self, data):
@@ -29,7 +25,7 @@ class Emitter:
 
 class Receiver:
     def __init__(self):
-        self._queue = None  # will be set by World.connect
+        self._queue = None
 
     def _bind(self, queue: mp.Queue):
         self._queue = queue
@@ -44,25 +40,35 @@ class Receiver:
             return None
 
 
-# --- World: orchestrates connections and processes ---
 class World:
     def __init__(self):
         self.processes = []
 
+    def __enter__(self):
+        print("[World] Entered context")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        print("[World] Exiting context...")
+        self.join_all()
+        print("[World] All background processes finished")
+
     def connect(self, emitter: Emitter, receiver: Receiver):
-        """Creates a shared queue and binds both ends to it."""
         queue = mp.Queue(maxsize=10)
         emitter._bind(queue)
         receiver._bind(queue)
 
-    def run_background(self, target):
-        p = mp.Process(target=target)
+    def run_background(self, target, *args):
+        """Launch a target function with arguments in a background process."""
+        p = mp.Process(target=target, args=args)
         p.start()
+        print(f"[World] Started background process {p.name} (pid={p.pid})")
         self.processes.append(p)
 
     def join_all(self):
         for p in self.processes:
             p.join()
+            print(f"[World] Process {p.name} finished")
 
 
 # --- Sensor system ---
@@ -71,7 +77,7 @@ def sensor_loop(emitter: Emitter):
         value = random.randint(0, 100)
         emitter.emit(value)
         print(f"[Sensor] Emitted {value}")
-        time.sleep(0.5)
+        time.sleep(1)
 
 
 # --- Controller system ---
@@ -85,19 +91,12 @@ def controller_loop(receiver: Receiver):
 
 # --- Run the system ---
 if __name__ == "__main__":
-    world = World()
+    with World() as world:
+        sensor_emitter = Emitter()
+        controller_receiver = Receiver()
 
-    sensor_emitter = Emitter()
-    controller_receiver = Receiver()
+        world.connect(sensor_emitter, controller_receiver)
 
-    # World now connects them through a shared Queue
-    world.connect(sensor_emitter, controller_receiver)
+        world.run_background(controller_loop, controller_receiver)
 
-    # Run controller in a background process
-    world.run_background(lambda: controller_loop(controller_receiver))
-
-    # Run sensor in main process
-    sensor_loop(sensor_emitter)
-
-    # Wait for background to finish
-    world.join_all()
+        sensor_loop(sensor_emitter)
