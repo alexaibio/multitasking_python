@@ -11,10 +11,13 @@ import multiprocessing as mp
 from collections import deque
 from enum import IntEnum
 from dataclasses import dataclass
+from typing import Generic, TypeVar, Sequence
+
+T = TypeVar("T")
 
 
 @dataclass
-class Message:
+class Message(Generic[T]):
     data: any
     ts: float
 
@@ -25,7 +28,20 @@ class TransportMode(IntEnum):
     SHARED_MEMORY = 2  # Not really used here, just to mirror your structure
 
 
-class LocalQueueEmitter:
+#### Typing classes
+class SignalEmitter(Generic[T]):
+    """Base class for type hinting."""
+    def emit(self, data: T) -> None:
+        ...
+
+class SignalReceiver(Generic[T]):
+    def read(self) -> Message[T] | None:
+        """Returns next message, otherwise last value. None if nothing was read yet."""
+        pass
+
+
+####### Emitters / Receivers
+class LocalQueueEmitter(SignalEmitter[T]):
     def __init__(self, queue: deque):
         self.queue = queue
 
@@ -35,23 +51,52 @@ class LocalQueueEmitter:
         print(f"[Emitter] Emitted {data} at {msg.ts:.2f}")
 
 
-class LocalQueueReceiver:
+class LocalQueueReceiver(SignalReceiver[T]):
     def __init__(self, queue: deque):
         self.queue = queue
         self.last_msg = None
 
-    def read(self):
+    def read(self) -> Message[T] | None:
         if self.queue:
             self.last_msg = self.queue.popleft()
         return self.last_msg
 
 
-class BroadcastEmitter:
-    """Broadcasts one message to multiple emitters."""
-    def __init__(self, emitters):
-        self.emitters = emitters
+# Multiprocess emitter/receiver using multiprocessing.Queue
+class MultiprocessEmitter(SignalEmitter[T]):
+    """Emitter for inter-process communication."""
+    def __init__(self, queue: mp.Queue):
+        self.queue = queue
 
-    def emit(self, data):
+    def emit(self, data: T) -> None:
+        msg = Message(data=data, ts=time.time())
+        self.queue.put(msg)
+        print(f"[MP Emitter] Emitted {data} at {msg.ts:.2f}")
+
+
+class MultiprocessReceiver(SignalReceiver[T]):
+    """Receiver for inter-process communication."""
+    def __init__(self, queue: mp.Queue):
+        self.queue = queue
+        self.last_msg: Message[T] | None = None
+
+    def read(self) -> Message[T] | None:
+        try:
+            self.last_msg = self.queue.get_nowait()
+        except mp.queues.Empty:
+            pass
+        return self.last_msg
+
+
+class BroadcastEmitter(SignalEmitter[T]):
+    """
+    Broadcasts one message to multiple emitters of the same type.
+    does not manage its own queue.
+    """
+    def __init__(self, emitters: Sequence[SignalEmitter[T]]):
+        self.emitters: Sequence[SignalEmitter[T]] = emitters
+
+    def emit(self, data: T) -> None:
         for e in self.emitters:
             e.emit(data)
 
@@ -105,6 +150,11 @@ class World:
         q = deque(maxlen=5)
         return LocalQueueEmitter(q), LocalQueueReceiver(q)
 
+    # NEW: Added multiprocessing pipe creator
+    def mp_pipe(self):
+        q = mp.Queue(maxsize=5)
+        return MultiprocessEmitter(q), MultiprocessReceiver(q)
+
     def start(self, main_loops, background_loops):
         # Start background control loops as separate processes
         for fn, args in background_loops:
@@ -138,7 +188,9 @@ class World:
 if __name__ == "__main__":
     world = World()
 
-    # Create a communication channel (local queue)
+    # choose either local or multiprocess pipe
+    # emitter, receiver = world.local_pipe()
+    #emitter, receiver = world.mp_pipe()
     emitter, receiver = world.local_pipe()
 
     # Background sensor runs in a subprocess
