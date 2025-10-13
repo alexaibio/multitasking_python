@@ -6,128 +6,146 @@
 
 """
 
-import multiprocessing as mp
 import time
-import random
+import multiprocessing as mp
 from collections import deque
 from enum import IntEnum
+from dataclasses import dataclass
 
 
+@dataclass
 class Message:
-    def __init__(self, data, ts=None):
-        self.data = data
-        self.ts = ts or time.time()
+    data: any
+    ts: float
 
 
 class TransportMode(IntEnum):
     UNDECIDED = 0
     QUEUE = 1
-    SHARED_MEMORY = 2
+    SHARED_MEMORY = 2  # Not really used here, just to mirror your structure
 
 
 class LocalQueueEmitter:
     def __init__(self, queue: deque):
-        self._queue = queue
+        self.queue = queue
 
     def emit(self, data):
-        self._queue.append(Message(data))
-        print(f"[LocalEmitter] Sent {data} (in-process)")
+        msg = Message(data=data, ts=time.time())
+        self.queue.append(msg)
+        print(f"[Emitter] Emitted {data} at {msg.ts:.2f}")
 
 
 class LocalQueueReceiver:
     def __init__(self, queue: deque):
-        self._queue = queue
-        self._last = None
+        self.queue = queue
+        self.last_msg = None
 
     def read(self):
-        if len(self._queue) > 0:
-            self._last = self._queue.popleft()
-        return self._last
-
-
-class MultiprocessEmitter:
-    def __init__(self, queue: mp.Queue, mode=TransportMode.UNDECIDED):
-        self._queue = queue
-        self._mode = mode
-
-    def emit(self, data):
-        if self._mode == TransportMode.UNDECIDED:
-            self._mode = TransportMode.QUEUE
-        self._queue.put(Message(data))
-        print(f"[MPEmitter] Sent {data} via {self._mode.name}")
-
-
-class MultiprocessReceiver:
-    def __init__(self, queue: mp.Queue):
-        self._queue = queue
-
-    def read(self):
-        try:
-            msg = self._queue.get(timeout=1)
-            return msg
-        except Exception:
-            return None
+        if self.queue:
+            self.last_msg = self.queue.popleft()
+        return self.last_msg
 
 
 class BroadcastEmitter:
+    """Broadcasts one message to multiple emitters."""
     def __init__(self, emitters):
         self.emitters = emitters
 
     def emit(self, data):
-        print(f"[BroadcastEmitter] Broadcasting {data} to {len(self.emitters)} targets")
         for e in self.emitters:
             e.emit(data)
 
+# ---------------------------------------------------------------------
+# Control Loop primitives
+# ---------------------------------------------------------------------
+@dataclass
+class Sleep:
+    seconds: float
 
-# -------------------------
-# SensorLoop (Producer)
-# -------------------------
-def sensor_loop(emitter, name="Sensor"):
-    """Simulate a periodic data producer."""
-    for i in range(5):
-        value = random.randint(0, 100)
-        emitter.emit(value)
-        print(f"[{name}] Emitted value {value}")
-        time.sleep(1.0)  # 1 Hz
+def sensor_loop(stop_event, emitter):
+    """Simulated ControlLoop: reads sensor and emits measurements."""
+    while not stop_event.is_set():
+        reading = round(20 + 5 * time.time() % 10, 2)  # Fake temperature
+        emitter.emit(reading)
+        yield Sleep(1.0)  # Sleep 1s between measurements
 
 
-# -------------------------
-# ControlLoop (Consumer)
-# -------------------------
-def control_loop(receiver, name="Controller"):
-    """Simulate a periodic controller that reads and reacts."""
-    for i in range(10):
+def controller_loop(stop_event, receiver):
+    """Simulated ControlLoop: reads from sensor and decides action."""
+    while not stop_event.is_set():
         msg = receiver.read()
         if msg:
-            print(f"[{name}] Received {msg.data} (ts={msg.ts:.2f}) → acting on it...")
-        else:
-            print(f"[{name}] Waiting for data...")
-        time.sleep(0.5)  # 2 Hz
+            action = "COOL" if msg.data > 25 else "HEAT"
+            print(f"[Controller] Received {msg.data:.2f}, Action: {action}")
+        yield Sleep(0.5)
 
 
-# -------------------------
-# Demo World
-# -------------------------
+
+def _bg_wrapper(control_loop_fn, stop_event, *args):
+    """Run a ControlLoop continuously until stop_event is set."""
+    loop = control_loop_fn(stop_event, *args)
+    try:
+        for command in loop:
+            if isinstance(command, Sleep):
+                time.sleep(command.seconds)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(f"[Background] Stopping {control_loop_fn.__name__}")
+
+# ---------------------------------------------------------------------
+# The “World” — orchestrating control loops
+# ---------------------------------------------------------------------
+class World:
+    def __init__(self):
+        self.stop_event = mp.Event()
+        self.bg_processes = []
+
+    def local_pipe(self):
+        q = deque(maxlen=5)
+        return LocalQueueEmitter(q), LocalQueueReceiver(q)
+
+    def start(self, main_loops, background_loops):
+        # Start background control loops as separate processes
+        for fn, args in background_loops:
+            p = mp.Process(target=_bg_wrapper, args=(fn, self.stop_event, *args))
+            p.start()
+            self.bg_processes.append(p)
+            print(f"[World] Started background process for {fn.__name__}")
+
+        # Run main loops cooperatively
+        try:
+            while not self.stop_event.is_set():
+                for fn, args in main_loops:
+                    loop = fn(self.stop_event, *args)
+                    try:
+                        command = next(loop)
+                        if isinstance(command, Sleep):
+                            time.sleep(command.seconds)
+                    except StopIteration:
+                        continue
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print("[World] Stopping...")
+            self.stop_event.set()
+            for p in self.bg_processes:
+                p.join()
+
+# ---------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    local_queue = deque(maxlen=10)
-    mp_queue = mp.Queue(maxsize=10)
+    world = World()
 
-    local_em = LocalQueueEmitter(local_queue)
-    local_re = LocalQueueReceiver(local_queue)
+    # Create a communication channel (local queue)
+    emitter, receiver = world.local_pipe()
 
-    mp_em = MultiprocessEmitter(mp_queue)
-    mp_re = MultiprocessReceiver(mp_queue)
+    # Background sensor runs in a subprocess
+    bg_loops = [(sensor_loop, (emitter,))]
 
-    # Combine emitters into a broadcast (fan-out)
-    broadcast = BroadcastEmitter([local_em, mp_em])
+    # Controller runs in main process
+    main_loops = [(controller_loop, (receiver,))]
 
-    # Start control loop in background (multiprocess)
-    proc = mp.Process(target=control_loop, args=(mp_re, "BackgroundController"))
-    proc.start()
+    world.start(main_loops, bg_loops)
 
-    # Run sensor and local control in main process
-    sensor_loop(broadcast, "MainSensor")
-    control_loop(local_re, "LocalController")
-
-    proc.join()
-    print("[World] Finished.")
