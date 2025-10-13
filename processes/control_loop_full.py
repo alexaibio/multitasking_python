@@ -8,6 +8,7 @@
 
 import multiprocessing as mp
 import time
+import random
 from collections import deque
 from enum import IntEnum
 
@@ -21,11 +22,10 @@ class Message:
 class TransportMode(IntEnum):
     UNDECIDED = 0
     QUEUE = 1
-    SHARED_MEMORY = 2  # we won't implement SM, just show mode switching
+    SHARED_MEMORY = 2
 
 
 class LocalQueueEmitter:
-    """Simulates LocalQueueEmitter — local, fast, same process."""
     def __init__(self, queue: deque):
         self._queue = queue
 
@@ -35,7 +35,6 @@ class LocalQueueEmitter:
 
 
 class LocalQueueReceiver:
-    """Simulates LocalQueueReceiver — reads from local queue."""
     def __init__(self, queue: deque):
         self._queue = queue
         self._last = None
@@ -46,9 +45,7 @@ class LocalQueueReceiver:
         return self._last
 
 
-
 class MultiprocessEmitter:
-    """Simulates MultiprocessEmitter — uses multiprocessing.Queue."""
     def __init__(self, queue: mp.Queue, mode=TransportMode.UNDECIDED):
         self._queue = queue
         self._mode = mode
@@ -61,20 +58,18 @@ class MultiprocessEmitter:
 
 
 class MultiprocessReceiver:
-    """Simulates MultiprocessReceiver — runs in another process."""
     def __init__(self, queue: mp.Queue):
         self._queue = queue
 
     def read(self):
         try:
             msg = self._queue.get(timeout=1)
-            print(f"[MPReceiver] Received {msg.data}")
+            return msg
         except Exception:
-            pass
+            return None
 
 
 class BroadcastEmitter:
-    """Broadcasts to multiple emitters."""
     def __init__(self, emitters):
         self.emitters = emitters
 
@@ -85,40 +80,54 @@ class BroadcastEmitter:
 
 
 # -------------------------
-# Demonstration
+# SensorLoop (Producer)
 # -------------------------
-def background_process(receiver: MultiprocessReceiver):
-    """Run in separate process."""
-    while True:
-        receiver.read()
+def sensor_loop(emitter, name="Sensor"):
+    """Simulate a periodic data producer."""
+    for i in range(5):
+        value = random.randint(0, 100)
+        emitter.emit(value)
+        print(f"[{name}] Emitted value {value}")
+        time.sleep(1.0)  # 1 Hz
 
 
+# -------------------------
+# ControlLoop (Consumer)
+# -------------------------
+def control_loop(receiver, name="Controller"):
+    """Simulate a periodic controller that reads and reacts."""
+    for i in range(10):
+        msg = receiver.read()
+        if msg:
+            print(f"[{name}] Received {msg.data} (ts={msg.ts:.2f}) → acting on it...")
+        else:
+            print(f"[{name}] Waiting for data...")
+        time.sleep(0.5)  # 2 Hz
+
+
+# -------------------------
+# Demo World
+# -------------------------
 if __name__ == "__main__":
-    # --- Local setup (same process) ---
     local_queue = deque(maxlen=10)
+    mp_queue = mp.Queue(maxsize=10)
+
     local_em = LocalQueueEmitter(local_queue)
     local_re = LocalQueueReceiver(local_queue)
 
-    # --- Multiprocess setup ---
-    mp_queue = mp.Queue(maxsize=10)
     mp_em = MultiprocessEmitter(mp_queue)
     mp_re = MultiprocessReceiver(mp_queue)
 
-    # Start background process to listen to mp_re
-    proc = mp.Process(target=background_process, args=(mp_re,), daemon=True)
-    proc.start()
-
-    # --- Combine using BroadcastEmitter ---
+    # Combine emitters into a broadcast (fan-out)
     broadcast = BroadcastEmitter([local_em, mp_em])
 
-    # --- Emit data ---
-    for i in range(3):
-        broadcast.emit(i)
-        time.sleep(0.5)
+    # Start control loop in background (multiprocess)
+    proc = mp.Process(target=control_loop, args=(mp_re, "BackgroundController"))
+    proc.start()
 
-        msg = local_re.read()
-        if msg:
-            print(f"[Main] Local receiver got {msg.data}")
+    # Run sensor and local control in main process
+    sensor_loop(broadcast, "MainSensor")
+    control_loop(local_re, "LocalController")
 
-    print("[Main] Done.")
-    proc.terminate()
+    proc.join()
+    print("[World] Finished.")
