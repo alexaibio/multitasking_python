@@ -182,9 +182,8 @@ class World:
 
 
     def start(self, main_loops, background_loops):
-        # keypress watcher
+        # Start keypress watcher
         threading.Thread(target=self._keypress_watcher, daemon=True).start()
-
 
         # Start background loops
         for fn, args in background_loops:
@@ -224,12 +223,16 @@ class World:
 if __name__ == "__main__":
     world = World()
 
-    # create multiple pipes for sensors
+    # create (emitter, receiver) pipe for sensors
     sensors = []
     for sid in ["Sensor A", "Sensor B", "Sensor C"]:
-        if PARALLELISM_TYPE == ParallelismType.PROCESS:      # <<< ADDED
+        if PARALLELISM_TYPE == ParallelismType.PROCESS:
+            emitter: MultiprocessEmitter
+            receiver: MultiprocessReceiver
             emitter, receiver = world.mp_pipe()
         else:  # THREAD mode
+            emitter: LocalQueueEmitter
+            receiver: LocalQueueReceiver
             emitter, receiver = world.local_pipe()
         sensors.append((sid, emitter, receiver))
 
