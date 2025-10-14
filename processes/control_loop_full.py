@@ -5,27 +5,37 @@
  - TransportMode       -  Enum that decides which transport to use (queue or shared memory)
 
 """
-
+import sys
 import time
+import threading
 import multiprocessing as mp
 from collections import deque
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Generic, TypeVar, Sequence
+from typing import Generic, TypeVar, Sequence, List
+import select
 
 T = TypeVar("T")
-
-
-@dataclass
-class Message(Generic[T]):
-    data: any
-    ts: float
 
 
 class TransportMode(IntEnum):
     UNDECIDED = 0
     QUEUE = 1
     SHARED_MEMORY = 2  # Not really used here, just to mirror your structure
+
+
+class ParallelismType(IntEnum):  # <<< ADDED
+    THREAD = 1
+    PROCESS = 2
+
+# Select execution mode here:
+PARALLELISM_TYPE = ParallelismType.PROCESS  # <<< ADDED  (change to PROCESS as needed)
+
+
+@dataclass
+class Message(Generic[T]):
+    data: any
+    ts: float
 
 
 #### Typing classes
@@ -107,22 +117,25 @@ class BroadcastEmitter(SignalEmitter[T]):
 class Sleep:
     seconds: float
 
-def sensor_loop(stop_event, emitter):
-    """Simulated ControlLoop: reads sensor and emits measurements."""
+
+def sensor_loop(stop_event, emitter, sensor_id="A"):  # <<< ADDED optional sensor_id
+    """Simulated sensor loop with optional ID."""
     while not stop_event.is_set():
-        reading = round(20 + 5 * time.time() % 10, 2)  # Fake temperature
-        emitter.emit(reading)
-        yield Sleep(1.0)  # Sleep 1s between measurements
+        reading = round(20 + 5 * (time.time() % 10), 2)
+        emitter.emit((sensor_id, reading))  # <<< emits labeled reading
+        yield Sleep(2.0)                    # Sleep 5s between measurements
 
 
-def controller_loop(stop_event, receiver):
-    """Simulated ControlLoop: reads from sensor and decides action."""
+def controller_loop(stop_event, receivers: List[SignalReceiver]):  # <<< MODIFIED to list
+    """Controller automatically reads from all sensors."""
     while not stop_event.is_set():
-        msg = receiver.read()
-        if msg:
-            action = "COOL" if msg.data > 25 else "HEAT"
-            print(f"[Controller] Received {msg.data:.2f}, Action: {action}")
-        yield Sleep(0.5)
+        for i, r in enumerate(receivers):  # <<< iterate all sensors
+            msg = r.read()
+            if msg:
+                sensor_id, value = msg.data
+                action = "COOL" if value > 25 else "HEAT"
+                print(f"[Controller] Sensor {sensor_id}: {value:.2f}, Action: {action}")
+        yield Sleep(5)
 
 
 
@@ -143,31 +156,54 @@ def _bg_wrapper(control_loop_fn, stop_event, *args):
 # ---------------------------------------------------------------------
 class World:
     def __init__(self):
-        self.stop_event = mp.Event()
-        self.bg_processes = []
+        self._stop_event = mp.Event()
+        self.bg_threads_or_processes = []
+
+    def _keypress_watcher(self):
+        print("[World] Press any key to stop simulation...")
+        while not self._stop_event.is_set():
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                sys.stdin.read(1)
+                print("\n[World] Key pressed. Stopping...")
+                self._stop_event.set()
 
     def local_pipe(self):
         q = deque(maxlen=5)
         return LocalQueueEmitter(q), LocalQueueReceiver(q)
 
-    # NEW: Added multiprocessing pipe creator
+    # multiprocessing pipe creator
     def mp_pipe(self):
         q = mp.Queue(maxsize=5)
         return MultiprocessEmitter(q), MultiprocessReceiver(q)
 
+    @property
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+
     def start(self, main_loops, background_loops):
-        # Start background control loops as separate processes
+        # keypress watcher
+        threading.Thread(target=self._keypress_watcher, daemon=True).start()
+
+
+        # Start background loops
         for fn, args in background_loops:
-            p = mp.Process(target=_bg_wrapper, args=(fn, self.stop_event, *args))
-            p.start()
-            self.bg_processes.append(p)
-            print(f"[World] Started background process for {fn.__name__}")
+            if PARALLELISM_TYPE == ParallelismType.PROCESS:
+                p = mp.Process(target=_bg_wrapper, args=(fn, self._stop_event, *args))
+                p.start()
+                self.bg_threads_or_processes.append(p)
+                print(f"[World] Started background process for {fn.__name__}")
+            else:  # THREAD
+                t = threading.Thread(target=_bg_wrapper, args=(fn, self._stop_event, *args), daemon=True)
+                t.start()
+                self.bg_threads_or_processes.append(t)
+                print(f"[World] Started background thread for {fn.__name__}")
 
         # Run main loops cooperatively
         try:
-            while not self.stop_event.is_set():
+            while not self._stop_event.is_set():
                 for fn, args in main_loops:
-                    loop = fn(self.stop_event, *args)
+                    loop = fn(self._stop_event, *args)
                     try:
                         command = next(loop)
                         if isinstance(command, Sleep):
@@ -178,8 +214,8 @@ class World:
             pass
         finally:
             print("[World] Stopping...")
-            self.stop_event.set()
-            for p in self.bg_processes:
+            self._stop_event.set()
+            for p in self.bg_threads_or_processes:
                 p.join()
 
 # ---------------------------------------------------------------------
@@ -188,16 +224,23 @@ class World:
 if __name__ == "__main__":
     world = World()
 
-    # choose either local or multiprocess pipe
-    # emitter, receiver = world.local_pipe()
-    #emitter, receiver = world.mp_pipe()
-    emitter, receiver = world.local_pipe()
+    # create multiple pipes for sensors
+    sensors = []
+    for sid in ["Sensor A", "Sensor B", "Sensor C"]:
+        if PARALLELISM_TYPE == ParallelismType.PROCESS:      # <<< ADDED
+            emitter, receiver = world.mp_pipe()
+        else:  # THREAD mode
+            emitter, receiver = world.local_pipe()
+        sensors.append((sid, emitter, receiver))
 
-    # Background sensor runs in a subprocess
-    bg_loops = [(sensor_loop, (emitter,))]
+    # create background loops list automatically
+    bg_loops = [(sensor_loop, (emitter, sid)) for sid, emitter, _ in sensors]
 
-    # Controller runs in main process
-    main_loops = [(controller_loop, (receiver,))]
+    # controller takes all receivers dynamically
+    receivers = [r for _, _, r in sensors]
+    main_loops = [(controller_loop, (receivers,))]
 
+    # START simulation - all processes
     world.start(main_loops, bg_loops)
+
 
