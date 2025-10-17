@@ -51,7 +51,7 @@ class World:
     def __exit__(self, exc_type, exc_value, traceback):
         print("[World] Exiting context...")
         self.join_all()
-        print("[World] All background processes finished")
+        print("[World] All background robotics_control_loop finished")
 
     def connect(self, emitter: Emitter, receiver: Receiver):
         queue = mp.Queue(maxsize=10)

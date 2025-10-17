@@ -105,7 +105,7 @@ class ParallelExecutor(BaseExecutor):
     which allows to run up to max_workers nodes concurrently.
 
     Args:
-        max_workers: Number of concurrent workers (processes) that will execute nodes.
+        max_workers: Number of concurrent workers (robotics_control_loop) that will execute nodes.
         log_stats_interval: The interval (in seconds) between printing the current execution stats.
             If None, no stats will be printed.
     """

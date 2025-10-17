@@ -39,7 +39,7 @@ class SignalReceiver:
 
 # --- The 'World' orchestrator ---
 class World:
-    """Orchestrator that connects systems, manages processes, and provides lifecycle control."""
+    """Orchestrator that connects systems, manages robotics_control_loop, and provides lifecycle control."""
     def __init__(self):
         self.processes: list[mp.Process] = []
         self.stop_event = mp.Event()
@@ -52,7 +52,7 @@ class World:
         print("[World] Exiting context...")
         self.stop_all()
         self.join_all()
-        print("[World] All processes cleaned up")
+        print("[World] All robotics_control_loop cleaned up")
 
     def connect(self) -> tuple[SignalEmitter, SignalReceiver]:
         """Create a queue and return paired emitter and receiver."""
@@ -72,7 +72,7 @@ class World:
         self.stop_event.set()
 
     def join_all(self):
-        """Wait for all background processes to finish."""
+        """Wait for all background robotics_control_loop to finish."""
         for p in self.processes:
             p.join()
             print(f"[World] Process {p.name} finished")
