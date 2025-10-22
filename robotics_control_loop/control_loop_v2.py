@@ -4,6 +4,7 @@
  - BroadcastEmitter    -  Sends each message to several emitters at once
  - TransportMode       -  which transport to use (queue or shared memory)
 """
+
 import sys
 import time
 import random
@@ -12,7 +13,8 @@ import multiprocessing as mp
 from collections import deque
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Generic, TypeVar, Sequence, List, Tuple, Any, Callable
+from typing import Generic, TypeVar, Sequence, List, Tuple, Any, Callable, Iterator
+from abc import ABC, abstractmethod
 import select
 
 T = TypeVar("T")
@@ -67,7 +69,7 @@ class Clock:
 
 
 
-#### Interfaces (Typing classes)
+#### Interfaces
 class SignalEmitter(Generic[T]):
     def emit(self, data: T) -> bool:
         """Add data to a queue as a Message"""
@@ -76,6 +78,16 @@ class SignalEmitter(Generic[T]):
 class SignalReceiver(Generic[T]):
     def read(self) -> Message[T] | None:
         """Returns next message, otherwise last value. None if nothing was read yet."""
+        ...
+
+class ControlSystem(ABC):
+    """
+    A substitution for senser_loop and controller_loop
+     - ControlSystem is a task that runs inside the world’s main control loop.
+     - each ControlSystem.run() acts like a coroutine that periodically yields to allow others to progress
+    """
+    @abstractmethod
+    def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         ...
 
 
@@ -146,56 +158,54 @@ class BroadcastEmitter(SignalEmitter[T]):
             e.emit(data)
 
 # ---------------------------------------------------------------------
-# Control Loop primitives
+# Control Systems
 # ---------------------------------------------------------------------
 
+class SensorSystem(ControlSystem):
+    """Sensor runs in background and periodically emits readings."""
+    def __init__(self, sensor: SensorSpec, emitter: SignalEmitter):
+        self.sensor = sensor
+        self.emitter = emitter
 
-def sensor_loop_gen(stop_event: mp.Event, emitter: SignalEmitter, sensor: SensorSpec):
-    """
-    Generator (cannot be sent to a thread)
-     - permanently read one sensor and emit its reading to queue
-     - return a command to be executed in main cooperative loop
-    """
-    while not stop_event.is_set():
-        reading = sensor.read_fn()
-        emitter.emit((sensor.id, reading))  # emits labeled reading as tuple
-        yield Sleep(1.0)                    # loop voluntarily pauses, World gets control back
-
-
-def controller_loop_gen(stop_event: mp.Event, receivers: List[SignalReceiver]):
-    """
-    Generator: for now single controller handles all sensors
-    """
-    while not stop_event.is_set():
-        # get last_reading from all sensors, do actions then ask to sleep for 10 sec
-        for sensor_idx, receiver in enumerate(receivers):  # iterate all sensors
-            msg = receiver.read()
-            if msg:
-                sensor_name, value = msg.data
-                action = "COOL" if value > 25 else "HEAT"
-                # OPTIONAL: actuator_emitter.emit(action)
-                print(f"  [Controller] Sensor [{sensor_name}] reading: {value:.2f}, Action: {action}")
-
-        yield Sleep(10)      # loop voluntarily pauses, World gets control back
+    def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
+        while not should_stop.is_set():
+            reading = self.sensor.read_fn()
+            self.emitter.emit((self.sensor.id, reading))
+            yield Sleep(self.sensor.interval)
 
 
+class ControllerSystem(ControlSystem):
+    """Controller reads from multiple sensor receivers."""
+    def __init__(self, receivers: List[SignalReceiver]):
+        self.receivers = receivers
 
-def _bg_wrapper(sensor_loop_fn, stop_event, *args):
+    def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
+        while not should_stop.is_set():
+            for receiver in self.receivers:
+                msg = receiver.read()
+                if msg:
+                    sensor_name, value = msg.data
+                    action = "COOL" if isinstance(value, (int, float)) and value > 25 else "HEAT"
+                    print(f"[Controller] {sensor_name}: {value} → Action: {action}")
+            yield Sleep(5.0)
+
+
+def _bg_wrapper(control_system: ControlSystem, stop_event: mp.Event, clock: Clock):
     """
      - Ready to be sent to bg thread, run until stop_event is set.
      - Execute command returned from generator
     """
-    generator_fn = sensor_loop_fn(stop_event, *args)
     try:
-        for command in generator_fn:
-            if isinstance(command, Sleep):
-                time.sleep(command.seconds)
-            else:
-                raise ValueError(f'Unknown command: {command}')
+        gen = control_system.run(stop_event, clock)
+        for cmd in gen:     # notice, we dont have next() here
+            if isinstance(cmd, Sleep):
+                time.sleep(cmd.seconds)
     except KeyboardInterrupt:
         pass
     finally:
-        print(f"[Background] Stopping {sensor_loop_fn.__name__}")
+        print(f"[World] Stopping background {control_system.__class__.__name__}")
+
+
 
 
 # ---------------------------------------------------------------------
@@ -233,46 +243,63 @@ class World:
         return self._stop_event.is_set()
 
 
-    def start(self, controller_loops, bg_loops):
+    def start(self,
+              controller_systems: List[ControlSystem],
+              bg_sensor_systems: List[ControlSystem]):
+        """
+        Start background sensor systems (each runs in its own thread/process) and then
+        run controller systems cooperatively in main thread as coroutines.
+
+        CHANGED: simplified API so start accepts lists of ControlSystem (not tuples of functions).
+        """
         print("[world] is starting")
+
         # Start keypress watcher
         threading.Thread(target=self._keypress_watcher, daemon=True).start()
 
-        ### Start background loops - true parallelism, in separate threads/processes.
-        for sensor_fn, args in bg_loops:
-            if PARALLELISM_TYPE == ParallelismType.PROCESS:     # run but Process
-                pr = mp.Process(target=_bg_wrapper, args=(sensor_fn, self._stop_event, *args))
+        ### Start background loops - independently, in separate threads/processes.
+        for sensor_system in bg_sensor_systems:
+            if PARALLELISM_TYPE == ParallelismType.PROCESS:
+                pr = mp.Process(target=_bg_wrapper, args=(sensor_system, self._stop_event, self.clock))
                 pr.start()
                 self.background_processes.append(pr)
-                print(f"[World] Started background process for {sensor_fn.__name__}")
-            else:                   # run by THREAD
-                thr = threading.Thread(target=_bg_wrapper, args=(sensor_fn, self._stop_event, *args), daemon=True)
+                print(f"[World] Started background process for {sensor_system.__class__.__name__}")
+            else:
+                thr = threading.Thread(target=_bg_wrapper, args=(sensor_system, self._stop_event, self.clock), daemon=True)
                 thr.start()
                 self.background_processes.append(thr)
-                print(f"[World] Started background thread for {sensor_fn.__name__}")
+                print(f"[World] Started background thread for {sensor_system.__class__.__name__}")
 
-        #### Run main loop (cooperative scheduling -  coroutines) inside the main thread
+
+        #### Run main loop (cooperative scheduling) inside the main thread
+        # CHANGED: run controller systems in cooperative round-robin by advancing their generators
+        gens: List[Iterator[Sleep]] = []
+        for cs in controller_systems:
+            gens.append(cs.run(self._stop_event, self.clock))
+
         try:                    # handle KeyboardInterrupt
-            while not self._stop_event.is_set():        # allows handling multiple controllers (whole system)
-                for sensor_fn, args in controller_loops:
-                    try:        # handle StopIteration when generator finishes
-                        control_flow_command = next(sensor_fn(self._stop_event, *args)) # generator
-
-                        # execute command: might also be Stor, Log - only control flow commands not actuators
+            while not self._stop_event.is_set() and gens:
+                # copy to allow removal during iteration
+                for g in list(gens):
+                    try:
+                        control_flow_command = next(g)
                         if isinstance(control_flow_command, Sleep):
                             time.sleep(control_flow_command.seconds)
                         else:
-                            raise ValueError(f" Wrong command {control_flow_command}")
+                            # unknown command: ignore or extend as needed
+                            pass
                     except StopIteration:
-                        print('Generator stopped by stop_event')
+                        # this controller finished, remove it
+                        gens.remove(g)
                         continue
         except KeyboardInterrupt:
             pass
         finally:
             print("[World] Stopping...")
             self._stop_event.set()
+            # join background threads/processes
             for pr in self.background_processes:
-                pr.join()       # Wait for process finish before continuing
+                pr.join()       # Wait for process/thread finish before continuing
 
 
 # ---------------------------------------------------------------------
@@ -280,8 +307,8 @@ class World:
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     # Select execution mode here:
-    PARALLELISM_TYPE = ParallelismType.PROCESS      # thread / process
-    TRANSPORT_MODE = TransportMode.QUEUE            # queue / shared_memory
+    PARALLELISM_TYPE = ParallelismType.PROCESS
+    TRANSPORT_MODE = TransportMode.QUEUE
 
     # Define sensors
     sensor_specs: list[SensorSpec] = [
@@ -306,21 +333,21 @@ if __name__ == "__main__":
 
         sensor_pipes.append((sensor_spec, emitter, receiver))
 
-    # create background loops list automatically
-    bg_loops = [
-        (sensor_loop_gen, (emitter, spec)) for spec, emitter, _ in sensor_pipes
-    ]
+    # create background loops list automatically using SensorSystem instances
+    bg_loops: List[ControlSystem] = [
+        SensorSystem(spec, emitter) for spec, emitter, _ in sensor_pipes
+    ]  # CHANGED: use SensorSystem objects
 
     # controller takes all receivers dynamically
     receivers = [r for _, _, r in sensor_pipes]
-    controller_loops = [
-        (controller_loop_gen, (receivers,))
-    ]
+    controller_loops: List[ControlSystem] = [
+        ControllerSystem(receivers)
+    ]  # CHANGED: use ControllerSystem object
 
     # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
     world.start(controller_loops, bg_loops)
 
-    # TODO: to stop the world it is possioble to run another process with stop event
+    # TODO: to stop the world it is possible to run another process with stop event
 
 
 
