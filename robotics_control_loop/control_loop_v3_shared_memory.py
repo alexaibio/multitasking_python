@@ -131,6 +131,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
     def emit(self, data: T) -> None:
         msg = Message(data=data, ts=self.clock.now())
+        # Emit appropriately
         if self.transport == TransportMode.QUEUE:
             self.queue.put(msg)
         elif self.transport == TransportMode.SHARED_MEMORY:
@@ -138,7 +139,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
                 size = data.buf_size()
                 shared_mem = shared_memory.SharedMemory(create=True, size=size)
                 data.set_to_buffer(shared_mem.buf)
-                msg.data = shared_mem.name  # send shared memory name
+                msg.data = shared_mem.name      # use queue to send shared memory name
                 self.queue.put(msg)
             else:
                 raise TypeError("Data must implement SMCompliant for shared memory")
@@ -197,20 +198,19 @@ class SensorSystem(ControlSystem):
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         while not should_stop.is_set():
             reading = self.sensor.read_fn()
-
+            # Emit reading via shared memory or queue
             if self.transport == TransportMode.SHARED_MEMORY:
-                # handle numpy data types
-                if isinstance(reading, np.ndarray):
+                if isinstance(reading, np.ndarray):     # id numpy array
                     adapter = NumpySMAdapter(reading)
                     self.emitter.emit(adapter)
-                elif isinstance(reading, dict):
+                elif isinstance(reading, dict):         # if dict of numpy arrays
                     adapter = NumpyDictAdapter(reading)
                     self.emitter.emit(adapter)
                 else:
                     print(f"[WARN] Sensor {self.sensor.id}: data not SMCompliant, using queue fallback.")
                     self.emitter.emit((self.sensor.id, reading))
             else:
-                # normal queue transport
+                # normal queue transport, via queue
                 self.emitter.emit((self.sensor.id, reading))
 
             yield Sleep(self.sensor.interval)
@@ -276,14 +276,13 @@ class SMCompliant(ABC):
 class NumpySMAdapter(SMCompliant):
     """Adapter for single numpy array."""
     def __init__(self, array: np.ndarray):
-        # do not modify original array
-        self.array = array.copy()
+        self.array = array.copy()   # do not modify original array
 
     def buf_size(self) -> int:
         return self.array.nbytes
 
     def set_to_buffer(self, buffer: memoryview | bytearray) -> None:
-        # copy raw bytes of the numpy array into the target buffer without any conversions (fast)
+        # copy raw bytes into the target buffer(fast)
         buffer[:self.array.nbytes] = self.array.tobytes()
 
     def read_from_buffer(self, buffer: memoryview | bytes) -> None:
@@ -357,8 +356,6 @@ class World:
         """
         Start background sensor systems (each runs in its own thread/process) and then
         run controller systems cooperatively in main thread as coroutines.
-
-        CHANGED: simplified API so start accepts lists of ControlSystem (not tuples of functions).
         """
         print("[world] is starting")
 
@@ -429,7 +426,6 @@ if __name__ == "__main__":
             interval=0.5,
         ),
     ]
-
 
     world = World()
 

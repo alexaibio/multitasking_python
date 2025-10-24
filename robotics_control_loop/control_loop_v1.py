@@ -180,7 +180,7 @@ def controller_loop_gen(stop_event: mp.Event, receivers: List[SignalReceiver]):
 
 
 
-def _bg_wrapper(sensor_loop_fn, stop_event, *args):
+def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
     """
      - Ready to be sent to bg thread, run until stop_event is set.
      - Execute command returned from generator
@@ -241,30 +241,30 @@ class World:
         ### Start background loops - true parallelism, in separate threads/processes.
         for sensor_fn, args in bg_loops:
             if PARALLELISM_TYPE == ParallelismType.PROCESS:     # run but Process
-                pr = mp.Process(target=_bg_wrapper, args=(sensor_fn, self._stop_event, *args))
+                pr = mp.Process(target=_bg_wrapper_loop, args=(sensor_fn, self._stop_event, *args))
                 pr.start()
                 self.background_processes.append(pr)
                 print(f"[World] Started background process for {sensor_fn.__name__}")
             else:                   # run by THREAD
-                thr = threading.Thread(target=_bg_wrapper, args=(sensor_fn, self._stop_event, *args), daemon=True)
+                thr = threading.Thread(target=_bg_wrapper_loop, args=(sensor_fn, self._stop_event, *args), daemon=True)
                 thr.start()
                 self.background_processes.append(thr)
                 print(f"[World] Started background thread for {sensor_fn.__name__}")
 
         #### Run main loop (cooperative scheduling -  coroutines) inside the main thread
         try:                    # handle KeyboardInterrupt
-            while not self._stop_event.is_set():        # allows handling multiple controllers (whole system)
+            while not self._stop_event.is_set():
+                # allows handling multiple controllers (whole system)
                 for sensor_fn, args in controller_loops:
                     try:        # handle StopIteration when generator finishes
-                        control_flow_command = next(sensor_fn(self._stop_event, *args)) # generator
-
+                        command = next(sensor_fn(self._stop_event, *args)) # generator
                         # execute command: might also be Stor, Log - only control flow commands not actuators
-                        if isinstance(control_flow_command, Sleep):
-                            time.sleep(control_flow_command.seconds)
+                        if isinstance(command, Sleep):
+                            time.sleep(command.seconds)
                         else:
-                            raise ValueError(f" Wrong command {control_flow_command}")
+                            raise ValueError(f" Wrong command {command}")
                     except StopIteration:
-                        print('Generator stopped by stop_event')
+                        print(f'...Control loop generator  {sensor_fn} stopped')
                         continue
         except KeyboardInterrupt:
             pass
