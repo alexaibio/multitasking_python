@@ -1,20 +1,11 @@
 """
-Decouple emitter and reveiver from SensorControlSystem
+Decouple emitter and receiver from SensorControlSystem
   SensorSystem(..., emitter=LocalQueueEmitter(...))
   ControllerSystem(..., receivers=[LocalQueueReceiver(...), ...])
 
-that previous implementation hard-codes the communication details into the systems,
+Previous implementation hard-codes the communication details into the systems,
 You can’t dynamically “connect” systems without rewriting code.
 
-
-"""
-
-
-"""
- - LocalQueueEmitter   -  Uses an in-memory `deque` → communication between thread
- - MultiprocessEmitter -  Uses `multiprocessing.Queue` → communication between processes
- - BroadcastEmitter    -  Sends each message to several emitters at once
- - TransportMode       -  which transport to use (queue or shared memory)
 """
 
 import sys
@@ -173,17 +164,18 @@ class BroadcastEmitter(SignalEmitter[T]):
         for e in self.emitters:
             e.emit(data)
 
+
+
 # ---------------------------------------------------------------------
 # Control Systems
 # ---------------------------------------------------------------------
 
-
 class ControlSystemEmitter(SignalEmitter[T]):
-    """Emitter adaptor that keeps track of its owning control system."""
+    """Adapter, Logical port: keep track and emits all emitters of one ControlSystem"""
 
     def __init__(self, owner: ControlSystem):
         self._owner = owner
-        self._internal: list[SignalEmitter[T]] = []
+        self._internal: list[SignalEmitter[T]] = []     # here are all emitters
 
     @property
     def owner(self) -> ControlSystem:
@@ -199,7 +191,6 @@ class ControlSystemEmitter(SignalEmitter[T]):
     def emit(self, data: T, ts: int = -1) -> bool:
         for emitter in self._internal:
             emitter.emit(data, ts)
-        # TODO: Remove bool as return type from all Emitters
         return True
 
 
@@ -208,7 +199,7 @@ class ControlSystemReceiver(SignalReceiver[T]):
 
     def __init__(self, owner: ControlSystem, maxsize: int | None = None):
         self._owner = owner
-        self._internal: SignalReceiver[T] | None = None
+        self._internal: SignalReceiver[T] | None = None     # ONLY one! not a List
         self._maxsize = maxsize
 
     @property
@@ -257,7 +248,6 @@ class FakeReceiver(ControlSystemReceiver[T]):
 
 class ReceiverDict(dict[str, ControlSystemReceiver[U]]):
     """Dictionary that lazily allocates receivers owned by a control system.
-
     Pass fake=True for all fake receivers, or fake={'key1', 'key2'} for specific keys.
     """
 
@@ -268,7 +258,12 @@ class ReceiverDict(dict[str, ControlSystemReceiver[U]]):
         self._all_fake = fake is True
 
     def __missing__(self, key: str) -> ControlSystemReceiver[U]:
+        """ Handle missing keys
+        decide Should I create a real receiver or a fake one?
+        """
+
         fake = self._all_fake or key in self._fake
+        # If fake is True → make a FakeReceiver otherwise normal ControlSystemReceiver
         receiver = FakeReceiver(self._owner) if fake else ControlSystemReceiver(self._owner)
         self[key] = receiver
         return receiver
@@ -300,10 +295,12 @@ class EmitterDict(dict[str, ControlSystemEmitter[U]]):
 
 class SensorSystem(ControlSystem):
     """Sensor runs in background and periodically emits readings."""
-    def __init__(self, sensor: SensorSpec):
+    def __init__(self, sensor: SensorSpec, emitter: SignalEmitter | None = None):
         self.sensor = sensor
         self.emitters = EmitterDict(self)
-        self.emitters["data"]           # create port lazily
+        if emitter is not None:
+            self.emitters["data"]._bind(emitter)
+
 
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         emitter = self.emitters["data"]
@@ -314,8 +311,13 @@ class SensorSystem(ControlSystem):
 
 
 class ControllerSystem(ControlSystem):
-    def __init__(self):
+    def __init__(self, receivers: List[SignalReceiver] | None = None):
         self.receivers = ReceiverDict(self)
+        if receivers:
+            # Assign each physical receiver to a logical port
+            for i, r in enumerate(receivers):
+                name = f"data_{i}"
+                self.receivers[name]._bind(r)
 
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         while not should_stop.is_set():
@@ -380,6 +382,28 @@ class World:
     def should_stop(self) -> bool:
         return self._stop_event.is_set()
 
+    ### generic connection between any two systems
+    def connect(self, emitter: ControlSystemEmitter, receiver: ControlSystemReceiver):
+        """Bind one logical emitter to one logical receiver by creating a physical pipe."""
+        if isinstance(emitter, FakeEmitter) or isinstance(receiver, FakeReceiver):
+            print(f"[World.connect] Ignored fake connection between {emitter.owner.__class__.__name__} and {receiver.owner.__class__.__name__}")
+            return
+
+        # choose transport type
+        if TRANSPORT_MODE == TransportMode.QUEUE:
+            if PARALLELISM_TYPE == ParallelismType.PROCESS:
+                physical_emitter, physical_receiver = self.new_mp_pipe()
+            else:
+                physical_emitter, physical_receiver = self.new_local_pipe()
+        else:
+            raise NotImplementedError("Only QUEUE transport implemented for now")
+
+        # bind both sides
+        emitter._bind(physical_emitter)
+        receiver._bind(physical_receiver)
+
+        print(f"[World.connect] Connected {emitter.owner.__class__.__name__} → {receiver.owner.__class__.__name__}")
+
 
     def start(self,
               controller_systems: List[ControlSystem],
@@ -443,6 +467,9 @@ class World:
 # ---------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     # Select execution mode here:
     PARALLELISM_TYPE = ParallelismType.PROCESS
@@ -458,34 +485,19 @@ if __name__ == "__main__":
     #### World Simulation
     world = World()         # CLOCK CREATED INSIDE WORLD to synchronize all sensors
 
-    # create (emitter, receiver) pipe for sensors
-    sensor_pipes: list[Tuple[SensorSpec, SignalEmitter, SignalReceiver]] = []
+    # Instantiate SensorSystems (no direct queue binding anymore)
+    ### CHANGED
+    sensors: list[SensorSystem] = [SensorSystem(spec) for spec in sensor_specs]
+    bg_loops: List[ControlSystem] = sensors   ### CHANGED
 
-    emitter: MultiprocessEmitter
-    receiver: MultiprocessReceiver
-    for sensor_spec in sensor_specs:
-        if PARALLELISM_TYPE == ParallelismType.PROCESS: # Process mode
-            emitter, receiver = world.new_mp_pipe()
-        else:                                    # THREAD mode: Sensor & controller live in the same process
-            emitter, receiver = world.new_local_pipe()
+    # Instantiate one controller system
+    ### ADDED
+    controller = ControllerSystem()
+    controller_loops: List[ControlSystem] = [controller]
 
-        sensor_pipes.append((sensor_spec, emitter, receiver))
+    # Connect each sensor emitter → controller receiver
+    for sensor in sensors:
+        world.connect(sensor.emitters["data"], controller.receivers[sensor.sensor.id])
 
-    # create background loops list automatically using SensorSystem instances
-    bg_loops: List[ControlSystem] = [
-        SensorSystem(spec, emitter) for spec, emitter, _ in sensor_pipes
-    ]  # CHANGED: use SensorSystem objects
-
-    # controller takes all receivers dynamically
-    receivers = [r for _, _, r in sensor_pipes]
-    controller_loops: List[ControlSystem] = [
-        ControllerSystem(receivers)
-    ]  # CHANGED: use ControllerSystem object
-
-    # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
+    # START simulation
     world.start(controller_loops, bg_loops)
-
-    # TODO: to stop the world it is possible to run another process with stop event
-
-
-
