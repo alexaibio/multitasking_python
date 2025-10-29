@@ -165,12 +165,12 @@ class SensorSystem(ControlSystem):
     """Sensor runs in background and periodically emits readings."""
     def __init__(self, sensor: SensorSpec, emitter: SignalEmitter):
         self.sensor = sensor
-        self.emitter = emitter
+        self.data_emitter = emitter
 
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         while not should_stop.is_set():
             reading = self.sensor.read_fn()
-            self.emitter.emit((self.sensor.id, reading))
+            self.data_emitter.emit((self.sensor.id, reading))
             yield Sleep(self.sensor.interval)
 
 
@@ -336,13 +336,13 @@ if __name__ == "__main__":
     # create background loops list automatically using SensorSystem instances
     bg_loops: List[ControlSystem] = [
         SensorSystem(spec, emitter) for spec, emitter, _ in sensor_pipes
-    ]  # CHANGED: use SensorSystem objects
+    ]
 
     # controller takes all receivers dynamically
     receivers = [r for _, _, r in sensor_pipes]
     controller_loops: List[ControlSystem] = [
         ControllerSystem(receivers)
-    ]  # CHANGED: use ControllerSystem object
+    ]
 
     # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
     world.start(controller_loops, bg_loops)

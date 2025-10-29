@@ -122,7 +122,6 @@ class LocalQueueReceiver(SignalReceiver[T]):
         return self.last_msg
 
 
-# Multiprocess emitter/receiver using multiprocessing.Queue
 class MultiprocessEmitter(SignalEmitter[T]):
     """Emitter for inter-process communication."""
     def __init__(self, queue: mp.Queue, clock: Clock):
@@ -166,16 +165,33 @@ class BroadcastEmitter(SignalEmitter[T]):
 
 
 
-# ---------------------------------------------------------------------
-# Control Systems
-# ---------------------------------------------------------------------
+"""
+----------------------------Control Systems-----------------------------------------
+Each ControlSystem (like a sensor or controller) is a small, self-contained unit that:
+ - runs its own loop (run() generator)
+ - periodically yields control (via yield Sleep(x))
+ - communicates only through emitters and receivers
+ 
+ControlSystem
+├── has → EmitterDict
+│     └── auto-creates → ControlSystemEmitter / FakeEmitter
+│
+└── has → ReceiverDict
+      └── auto-creates → ControlSystemReceiver / FakeReceiver
+
+---------------------------------------------------------------------
+"""
+
 
 class ControlSystemEmitter(SignalEmitter[T]):
-    """Adapter, Logical port: keep track and emits all emitters of one ControlSystem"""
+    """
+    Adapter, Logical port: keep track and emits all emitters of one ControlSystem
+    logical adapters, not physical queues.
+    """
 
     def __init__(self, owner: ControlSystem):
         self._owner = owner
-        self._internal: list[SignalEmitter[T]] = []     # here are all emitters
+        self._internal: list[SignalEmitter[T]] = []     # here are all emitters: LocalQueue or Multiprocess
 
     @property
     def owner(self) -> ControlSystem:
@@ -188,9 +204,9 @@ class ControlSystemEmitter(SignalEmitter[T]):
     def _bind(self, emitter: SignalEmitter[T]):
         self._internal.append(emitter)
 
-    def emit(self, data: T, ts: int = -1) -> bool:
+    def emit(self, data: T) -> bool:
         for emitter in self._internal:
-            emitter.emit(data, ts)
+            emitter.emit(data)
         return True
 
 
@@ -246,6 +262,26 @@ class FakeReceiver(ControlSystemReceiver[T]):
         raise RuntimeError('FakeReceiver._bind() is not supposed to be called')
 
 
+class EmitterDict(dict[str, ControlSystemEmitter[U]]):
+    """Dictionary that lazily allocates emitters owned by a control system.
+    Pass fake=True for all fake emitters, or fake={'key1', 'key2'} for specific keys.
+    """
+
+    def __init__(self, owner: ControlSystem, fake: bool | Iterable[str] = False):
+        super().__init__()
+        self._owner = owner
+        self._fake = set(fake) if isinstance(fake, Iterable) else set()
+        self._all_fake = fake is True
+
+    def __missing__(self, key: str) -> ControlSystemEmitter[U]:
+        # extend dictionary: auto-create emitters when accessed
+        # for example by sensor.emitters["data"] - create a new ControlSystemEmitter(owner=sensor)
+        fake = self._all_fake or key in self._fake
+        emitter = FakeEmitter(self._owner) if fake else ControlSystemEmitter(self._owner)
+        self[key] = emitter
+        return emitter
+
+
 class ReceiverDict(dict[str, ControlSystemReceiver[U]]):
     """Dictionary that lazily allocates receivers owned by a control system.
     Pass fake=True for all fake receivers, or fake={'key1', 'key2'} for specific keys.
@@ -269,37 +305,21 @@ class ReceiverDict(dict[str, ControlSystemReceiver[U]]):
         return receiver
 
 
-class EmitterDict(dict[str, ControlSystemEmitter[U]]):
-    """Dictionary that lazily allocates emitters owned by a control system.
 
-    Pass fake=True for all fake emitters, or fake={'key1', 'key2'} for specific keys.
-    """
-
-    def __init__(self, owner: ControlSystem, fake: bool | Iterable[str] = False):
-        super().__init__()
-        self._owner = owner
-        self._fake = set(fake) if isinstance(fake, Iterable) else set()
-        self._all_fake = fake is True
-
-    def __missing__(self, key: str) -> ControlSystemEmitter[U]:
-        # extend dictionary: auto-create emitters when accessed
-        # for example by sensor.emitters["data"] - create a new ControlSystemEmitter(owner=sensor)
-        fake = self._all_fake or key in self._fake
-        emitter = FakeEmitter(self._owner) if fake else ControlSystemEmitter(self._owner)
-        self[key] = emitter
-        return emitter
 
 
 #####  SensorSystem and ControllerSystem implementations
 ########################################################
 
 class SensorSystem(ControlSystem):
-    """Sensor runs in background and periodically emits readings."""
+    """Sensor generator Loop, un in background"""
     def __init__(self, sensor: SensorSpec, emitter: SignalEmitter | None = None):
         self.sensor = sensor
-        self.emitters = EmitterDict(self)
+        # declare named signal endpoints without hardcoding connections.
+        # no need to predefine self.data_emitter
+        self.emitters = EmitterDict(self)       # sending self makes it owned
         if emitter is not None:
-            self.emitters["data"]._bind(emitter)
+            self.emitters["data"]._bind(emitter)    # previosly it was self.data_emitter
 
 
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
@@ -464,14 +484,12 @@ class World:
                 pr.join()       # Wait for process/thread finish before continuing
 
 
-# ---------------------------------------------------------------------
-# Demo
-# ---------------------------------------------------------------------
+
 # ---------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # Select execution mode here:
+    # Select execution mode here
     PARALLELISM_TYPE = ParallelismType.PROCESS
     TRANSPORT_MODE = TransportMode.QUEUE
 
@@ -485,17 +503,19 @@ if __name__ == "__main__":
     #### World Simulation
     world = World()         # CLOCK CREATED INSIDE WORLD to synchronize all sensors
 
-    # Instantiate SensorSystems (no direct queue binding anymore)
-    ### CHANGED
+    #### Create many Sentors and one Contriller
+    # SensorSystems: no direct queue binding, no wired design enymore
+    # it is decoupled now - no creating pipes
+    # actual emitter binding happens in world.connect()
     sensors: list[SensorSystem] = [SensorSystem(spec) for spec in sensor_specs]
-    bg_loops: List[ControlSystem] = sensors   ### CHANGED
+    bg_loops: List[ControlSystem] = sensors
 
     # Instantiate one controller system
-    ### ADDED
     controller = ControllerSystem()
     controller_loops: List[ControlSystem] = [controller]
 
     # Connect each sensor emitter → controller receiver
+    # NOTE: accessing a key (emitters["data"]) is both lazy creation and retrieval
     for sensor in sensors:
         world.connect(sensor.emitters["data"], controller.receivers[sensor.sensor.id])
 
