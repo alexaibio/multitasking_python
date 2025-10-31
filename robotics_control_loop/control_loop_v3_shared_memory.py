@@ -127,7 +127,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
     def __init__(self, queue: mp.Queue, clock: Clock, transport=TransportMode.QUEUE):
         self.queue = queue
         self.clock = clock
-        self.transport = transport  # CHANGED: transport mode
+        self.transport = transport
 
     def emit(self, data: T) -> None:
         msg = Message(data=data, ts=self.clock.now())
@@ -136,6 +136,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
             self.queue.put(msg)
         elif self.transport == TransportMode.SHARED_MEMORY:
             if isinstance(data, SMCompliant):
+                # create a shared memory block
                 size = data.buf_size()
                 shared_mem = shared_memory.SharedMemory(create=True, size=size)
                 data.set_to_buffer(shared_mem.buf)
@@ -431,20 +432,22 @@ if __name__ == "__main__":
 
     # create sensor pipes
     sensor_pipes = []
-    for spec in sensor_specs:
+    for sensor in sensor_specs:
         if PARALLELISM_TYPE == ParallelismType.PROCESS:
             q = mp.Queue(maxsize=5)
-            emitter = MultiprocessEmitter(q, world.clock, transport=spec.transport)
-            receiver = MultiprocessReceiver(q,
-                                            spec.transport,
-                                            NumpyDictAdapter if spec.transport == TransportMode.SHARED_MEMORY else None)
+            emitter = MultiprocessEmitter(q, world.clock, transport=sensor.transport)
+            receiver = MultiprocessReceiver(queue=q,
+                                            transport=sensor.transport,
+                                            sm_class=NumpyDictAdapter if sensor.transport == TransportMode.SHARED_MEMORY else None)
         else:
             emitter, receiver = world.new_local_pipe()
 
-        sensor_pipes.append((spec, emitter, receiver))
+        sensor_pipes.append((sensor, emitter, receiver))
 
     # create background loops
-    bg_loops = [SensorSystem(spec, emitter) for spec, emitter, _ in sensor_pipes]
+    # sensors
+    bg_loops = [SensorSystem(sensor_spec, emitter) for sensor_spec, emitter, _ in sensor_pipes]
+    # controllers
     receivers = [r for _, _, r in sensor_pipes]
     controller_loops = [ControllerSystem(receivers)]
 

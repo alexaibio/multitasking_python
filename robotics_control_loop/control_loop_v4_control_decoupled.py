@@ -151,19 +151,6 @@ class MultiprocessReceiver(SignalReceiver[T]):
         return self.last_msg
 
 
-class BroadcastEmitter(SignalEmitter[T]):
-    """
-    Broadcasts one message to multiple emitters of the same type.
-    does not manage its own queue.
-    """
-    def __init__(self, emitters: Sequence[SignalEmitter[T]]):
-        self.emitters: Sequence[SignalEmitter[T]] = emitters
-
-    def emit(self, data: T) -> None:
-        for e in self.emitters:
-            e.emit(data)
-
-
 
 """
 ----------------------------Control Systems-----------------------------------------
@@ -295,10 +282,10 @@ class ReceiverDict(dict[str, ControlSystemReceiver[U]]):
 
     def __missing__(self, key: str) -> ControlSystemReceiver[U]:
         """ Handle missing keys
-        decide Should I create a real receiver or a fake one?
+        Should I create a real receiver or a fake one?
         """
 
-        fake = self._all_fake or key in self._fake
+        fake = self._all_fake or key in self._fake  # should receiver be fake or real?
         # If fake is True → make a FakeReceiver otherwise normal ControlSystemReceiver
         receiver = FakeReceiver(self._owner) if fake else ControlSystemReceiver(self._owner)
         self[key] = receiver
@@ -338,6 +325,7 @@ class ControllerSystem(ControlSystem):
             for i, r in enumerate(receivers):
                 name = f"data_{i}"
                 self.receivers[name]._bind(r)
+        #TODO: self.robot_commands = ControlSystemEmitter(self) - add emitting action as commands to anoter pipe
 
     def run(self, should_stop: mp.Event, clock: Clock) -> Iterator[Sleep]:
         while not should_stop.is_set():
@@ -345,8 +333,13 @@ class ControllerSystem(ControlSystem):
                 msg = receiver.read()
                 if msg:
                     sensor_name, value = msg.data
+
+                    # TODO: may be run a policy and calculate a command to actuators
                     action = "COOL" if isinstance(value, (int, float)) and value > 25 else "HEAT"
+
+                    # TODO: emit action as a command to actuators
                     print(f"[Controller] {name}: {value} → {action}")
+
             yield Sleep(5.0)
 
 
@@ -508,7 +501,7 @@ if __name__ == "__main__":
     # it is decoupled now - no creating pipes
     # actual emitter binding happens in world.connect()
     sensors: list[SensorSystem] = [SensorSystem(spec) for spec in sensor_specs]
-    bg_loops: List[ControlSystem] = sensors
+    bg_loops: List[ControlSystem] = sensors     # might also be other loops (logs?) launched in background
 
     # Instantiate one controller system
     controller = ControllerSystem()
@@ -517,7 +510,10 @@ if __name__ == "__main__":
     # Connect each sensor emitter → controller receiver
     # NOTE: accessing a key (emitters["data"]) is both lazy creation and retrieval
     for sensor in sensors:
-        world.connect(sensor.emitters["data"], controller.receivers[sensor.sensor.id])
+        world.connect(
+            sensor.emitters["data"],    # return ControlSystemEmitter[U]
+            controller.receivers[sensor.sensor.id]  # automatically create a ControlSystemReceiver, equivalent to receivers["temp_sensor"]
+        )
 
     # START simulation
     world.start(controller_loops, bg_loops)
