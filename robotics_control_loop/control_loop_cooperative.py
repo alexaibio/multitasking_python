@@ -1,13 +1,20 @@
+"""
+The simple example of cooperative scheduling loop to process robotics loops.
+Explains:
+ - running sensor loops in separate threads
+ - cooperative scheduling with generators
+"""
 import time
 import random
 from collections import deque
 from dataclasses import dataclass
-from threading import Thread
+import threading as th
 from typing import Iterator, Iterable
 
 
 @dataclass
 class Message:
+    """That what sensors send to controllers"""
     data: any
     ts: int = -1
 
@@ -54,44 +61,51 @@ class Receiver:
 
 # --- Control loops ----------------------------------------------------------
 
-def sensor_loop(emitter: Emitter, name: str, interval: float):
-    """Background sensor producing messages periodically."""
-    for i in range(5):
-        value = random.randint(0, 100)
-        emitter.emit((name, value))
-        print(f"[{name}] Emitted {value}")
-        time.sleep(interval)
-    print(f"[{name}] Finished")
+def sensor_loop(stop_event, emitter: Emitter, name: str) -> Iterator[Sleep]:
+    """Background Sensor loop with generator. Run in its own thread"""
+    while not stop_event.is_set():
+        sensor_reading = random.randint(0, 100)
+        emitter.emit((name, sensor_reading))
+        print(f"   --> Sensor [{name}] Emitted {sensor_reading}")
+        yield Sleep(2)   # stop here and give up control to Controller
+    print(f"Sensor [{name}] Finished")
 
 
 def controller_loop(receiver: Receiver, name: str) -> Iterator[Sleep]:
     """Foreground controller consuming messages cooperatively."""
-    count = 0
-    while count < 30:
+    while True:
         msg = receiver.read()
         if msg:
             sensor_name, value = msg.data
-            print(f"[{name}] Got {value} from {sensor_name} (ts={msg.ts})")
-        yield Sleep(0.2)
-        count += 1
-    print(f"[{name}] Finished")
+            print(f"Receiver [{name}] Got {value} from {sensor_name} (ts={msg.ts})")
+            # ACTION: take an action based on sensor reading, maybe emit another message
+        yield Sleep(5.0)
+    print(f"Controller [{name}] Finished")
 
 
-# --- Cooperative world ------------------------------------------------------
+
+# --- Cooperative world context ------------------------------------------------------
 
 class World:
     def __init__(self):
-        self._background_threads: list[Thread] = []
+        self._stop_event = th.Event()
+        self._background_threads: list[th.Thread] = []
 
     def __enter__(self):
         print("[World] Entered context")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """Stop all background trheads at the end of Worls"""
+        self.stop()
         print("[World] Exiting context...")
         for t in self._background_threads:
-            t.join()
+            t.join()    # wait until that thread’s function returns after stop signal
             print(f"[World] Background thread {t.name} finished")
+
+    def stop(self):
+        print("[World] Stopping sensors...")
+        self._stop_event.set()
 
     def connect(self, emitter: Emitter, receiver: Receiver):
         """Connect emitter and receiver via a local queue."""
@@ -100,37 +114,42 @@ class World:
         receiver._bind(queue)
         print("[World] Connected emitter <-> receiver")
 
-    def start_background(self, *sensor_loops):
-        """Start background sensor loops in separate threads."""
-        for loop_func in sensor_loops:
-            t = Thread(target=loop_func, daemon=True)
+
+    def _bg_sensor_wrapper(self, gen: Iterator[Sleep]):
+        try:
+            for cmd in gen:
+                if isinstance(cmd, Sleep):
+                    time.sleep(cmd.seconds)
+                else:
+                    raise ValueError(f"Unexpected command {cmd}")
+        except StopIteration:
+            pass
+        print("[World] Sensor loop finished")  ### CHANGED
+
+
+    def start(self, *, sensor_loops: list, controller_loops: list):
+        """Run background sensors and cooperative controllers."""
+
+        #### Start background sensor generator loops in separate threads
+        for sensor_loop_gen in sensor_loops:
+            t = th.Thread(target=self._bg_sensor_wrapper, args=(sensor_loop_gen,), daemon=True)
             t.start()
             self._background_threads.append(t)
             print(f"[World] Started background thread {t.name}")
 
-    def start(self, *, sensor_loops=(), controller_loops=()):
-        """Run background sensors and cooperative controllers."""
-        # Start background sensor threads
-        self.start_background(*sensor_loops)
-
-        # Run cooperative controllers in main thread
-        print("[World] Starting cooperative foreground loops...")
-        loops = list(controller_loops)
-
-        while loops:
-            still_running = []
-            for loop in loops:
+        #### Start cooperative controllers in main thread
+        while not self._stop_event.is_set():
+            for loop in controller_loops:
                 try:
-                    sleep_obj = next(loop)
-                    if sleep_obj.seconds > 0:
-                        time.sleep(sleep_obj.seconds)
-                    still_running.append(loop)
+                    command = next(loop)
+                    if isinstance(command, Sleep):
+                        time.sleep(command.seconds)
+                    else:
+                        raise ValueError(f" Wrong command {command}")
                 except StopIteration:
                     continue
-            loops = still_running
 
         print("[World] All cooperative loops completed.")
-
 
 
 if __name__ == "__main__":
@@ -141,29 +160,24 @@ if __name__ == "__main__":
 
         # Create controllers
         camera_controller = Receiver()
+        image_storage_controller = Receiver()
         lidar_controller = Receiver()
-        storage_controller = Receiver()
-
 
         # Connect each emitter to multiple receivers (fan-out)
         world.connect(camera, camera_controller)
-        world.connect(camera, storage_controller)
-
+        world.connect(camera, image_storage_controller)
         world.connect(lidar_sensor, lidar_controller)
 
-
-        # Prepare background sensor loops
         sensor_loops = [
-            lambda: sensor_loop(camera, "TempSensor", 1.0),
-            lambda: sensor_loop(lidar_sensor, "LidarSensor", 1.5),
-            lambda: sensor_loop(cam_sensor, "CameraSensor", 2.0),
+            sensor_loop(world._stop_event, camera, "TempSensor"),
+            sensor_loop(world._stop_event, lidar_sensor, "LidarSensor"),
         ]
 
-        # Prepare cooperative controller loops
         controller_loops = [
             controller_loop(camera_controller, "MainController"),
-            controller_loop(storage_controller, "Logger"),
+            controller_loop(image_storage_controller, "Logger"),
         ]
 
-        # Run everything
+        # Run World: reas all sensors in a real time
         world.start(sensor_loops=sensor_loops, controller_loops=controller_loops)
+
