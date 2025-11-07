@@ -20,6 +20,7 @@ class Message:
 
 @dataclass
 class Sleep:
+    """A command to send from Sensor to Controller"""
     seconds: float
 
 
@@ -58,22 +59,20 @@ class Receiver:
         return None
 
 
-
 # --- Control loops ----------------------------------------------------------
-
 def sensor_loop(stop_event, emitter: Emitter, name: str) -> Iterator[Sleep]:
     """Background Sensor loop with generator. Run in its own thread"""
     while not stop_event.is_set():
         sensor_reading = random.randint(0, 100)
         emitter.emit((name, sensor_reading))
         print(f"   --> Sensor [{name}] Emitted {sensor_reading}")
-        yield Sleep(2)   # stop here and give up control to Controller
+        yield Sleep(2)   # stop here and give up control to Controller by sendin a Sleep Command
     print(f"Sensor [{name}] Finished")
 
 
-def controller_loop(receiver: Receiver, name: str) -> Iterator[Sleep]:
+def controller_loop(stop_event, receiver: Receiver, name: str) -> Iterator[Sleep]:
     """Foreground controller consuming messages cooperatively."""
-    while True:
+    while not stop_event.is_set():
         msg = receiver.read()
         if msg:
             sensor_name, value = msg.data
@@ -174,8 +173,8 @@ if __name__ == "__main__":
         ]
 
         controller_loops = [
-            controller_loop(camera_controller, "MainController"),
-            controller_loop(image_storage_controller, "Logger"),
+            controller_loop(world._stop_event, camera_controller, "MainController"),
+            controller_loop(world._stop_event, image_storage_controller, "Logger"),
         ]
 
         # Run World: reas all sensors in a real time
