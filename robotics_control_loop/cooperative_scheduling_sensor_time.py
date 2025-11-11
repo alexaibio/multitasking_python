@@ -1,13 +1,9 @@
 """
-The simple example of cooperative scheduling loop to process robotics loops.
-
-Explains:
- - running sensor loops in separate threads
- - cooperative scheduling with generators
+The minimum example of cooperative scheduling with sensor-controlled world in robotics.
 
 Note
- - all loops are running cooperatively inside a single thread.
- - In this example time is controlled by sensors!
+ - all loops are running cooperatively inside a single thread, no separate thread/processes.
+ - time is controlled by sensors, no global clock.
 """
 import time
 import random
@@ -43,6 +39,7 @@ class Emitter:
         for q in self._queues:
             if len(q) < q.maxlen:
                 q.append(msg)
+            print(f"   --> Emitted {data}")
 
 
 class Receiver:
@@ -65,12 +62,11 @@ class Receiver:
 
 # --- Control loops ----------------------------------------------------------
 def sensor_loop(stop_check: Callable[[], bool], emitter: Emitter, name: str) -> Iterator[Sleep]:
-    """Background Sensor loop with generator. Run in its own thread"""
+    """Sensor loop with generator, might be run a background process later."""
     while not stop_check():
         sensor_reading = random.randint(0, 100)
         emitter.emit((name, sensor_reading))
-        print(f"   --> Sensor [{name}] Emitted {sensor_reading}")
-        yield Sleep(2)   # stop here and give up control to Controller by sendin a Sleep Command
+        yield Sleep(2.0)   # stop here and give up control to Controller by sending a Sleep Command
     print(f"Sensor [{name}] Finished")
 
 
@@ -106,7 +102,7 @@ class World:
         receiver._bind(queue)
         print("[World] Connected emitter <-> receiver")
 
-    def start(self, *, sensor_loops: list[Iterator[Sleep]], controller_loops: list[Iterator[Sleep]]):
+    def run(self, *, sensor_loops: list[Iterator[Sleep]], controller_loops: list[Iterator[Sleep]]):
         """Run cooperative scheduling loop for both sensors and controllers."""
         print("[World] Starting cooperative world... (Ctrl+C to stop)")
         try:
@@ -117,6 +113,7 @@ class World:
             while not self._stop:
                 now = time.time()
 
+                # sensors loop might be run in separate thread/process in background, that is we separate them
                 #### Cooperative scheduling for sensors
                 for s_loop in sensor_loops:
                     if now >= sensor_next_time[s_loop]:     # read only if its time has come
@@ -185,4 +182,4 @@ if __name__ == "__main__":
     ]
 
     # Run everything cooperatively in one thread
-    world.start(sensor_loops=sensor_loops, controller_loops=controller_loops)
+    world.run(sensor_loops=sensor_loops, controller_loops=controller_loops)

@@ -1,3 +1,11 @@
+"""
+The minimum example of cooperative scheduling with Global-clock world in robotics.
+
+Note
+ - all loops are running cooperatively inside a single thread, no separate thread/processes.
+ - time is controlled by World ata certain FPS.
+"""
+
 import time
 import random
 from collections import deque
@@ -27,7 +35,7 @@ class Emitter:
         for q in self._queues:
             if len(q) < q.maxlen:
                 q.append(msg)
-        print(f"   --> Emitted {data}")
+            print(f"   --> Emitted {data}")
 
 
 class Receiver:
@@ -68,11 +76,11 @@ def controller_loop(stop_check: Callable[[], bool], receiver: Receiver, name: st
 class World:
     """Global-clock cooperative scheduler with per-task sleep."""
 
-    def __init__(self, fps: int = 30):
+    def __init__(self, fps: int = 10):
         self._stop = False
         self._fps = fps
         self._dt = 1.0 / fps  # global maximum step
-        self._tasks_next_time: dict[Iterator, float] = {}
+        self._next_time_run: dict[Iterator, float] = {}
 
     def connect(self, emitter: Emitter, receiver: Receiver):
         queue = deque(maxlen=10)
@@ -86,13 +94,13 @@ class World:
     def is_stopped(self) -> bool:   # ← helper for readability
         return self._stop
 
-    def start(self, *, sensor_loops: list[Iterator], controller_loops: list[Iterator]):
+    def run(self, *, sensor_loops: list[Iterator], controller_loops: list[Iterator]):
         """Run cooperative loops with per-task sleep until Ctrl+C."""
         print(f"[World] Starting global clock world at {self._fps} FPS (Ctrl+C to stop)...")
 
         all_loops = sensor_loops + controller_loops
         now = time.time()
-        self._tasks_next_time = {loop: now for loop in all_loops}
+        self._next_time_run = {loop: now for loop in all_loops}
 
         frame = 0
         try:
@@ -102,21 +110,21 @@ class World:
 
                 # --- Run loops whose sleep has expired
                 for loop in all_loops:
-                    if now >= self._tasks_next_time[loop]:
+                    if now >= self._next_time_run[loop]:
                         try:
                             command = next(loop)
                             if isinstance(command, Sleep):
-                                self._tasks_next_time[loop] = now + command.seconds
+                                self._next_time_run[loop] = now + command.seconds
                             else:
                                 # if coroutine yields None, just run next frame
-                                self._tasks_next_time[loop] = now
+                                self._next_time_run[loop] = now
                         except StopIteration:
                             # optional: remove finished loops
-                            self._tasks_next_time.pop(loop)
+                            self._next_time_run.pop(loop)
 
                 # --- Global frame pacing (do not exceed max FPS)
                 elapsed = time.time() - frame_start
-                sleep_time = max(0, self._dt - elapsed)
+                sleep_time = max(0.0, self._dt - elapsed)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
@@ -157,4 +165,4 @@ if __name__ == "__main__":
     ]
 
     # Run world
-    world.start(sensor_loops=sensor_loops, controller_loops=controller_loops)
+    world.run(sensor_loops=sensor_loops, controller_loops=controller_loops)
