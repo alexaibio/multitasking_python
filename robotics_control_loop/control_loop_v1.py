@@ -19,7 +19,6 @@ from collections import deque
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Generic, TypeVar, Sequence, List, Tuple, Any, Callable
-import select
 import numpy as np
 from abc import ABC, abstractmethod
 
@@ -37,8 +36,7 @@ class TransportMode(IntEnum):
 
 class ParallelismType(IntEnum):
     LOCAL = 0
-    #THREAD = 1
-    PROCESS = 2
+    MULTIPROCESS = 2
 
 @dataclass
 class Sleep:
@@ -50,7 +48,6 @@ class Clock:
         return time.time()
 
     def now_ns(self) -> int:
-        """Current timestamp in nanoseconds."""
         return time.time_ns()
 
 
@@ -134,7 +131,9 @@ class LocalQueueEmitter(SignalEmitter[T]):
     def emit(self, data: T):
         msg = Message(data=data, ts=self.clock.now_ns())       # TODO: better get it from World as parameter
         self.queue.append(msg)
-        print(f"[Local Emitter] Emitted |{data}| at {msg.ts:.2f}\n")
+
+        print_friendly_data = msg.data[1] if not isinstance(msg.data[1], np.ndarray) else msg.data[1][0,0].tolist()
+        print(f"[Local Emitter] Emitted |{print_friendly_data}| at {msg.ts:.2f}\n")
         return True
 
 
@@ -159,6 +158,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
     def emit(self, data: T) -> None:
         msg = Message(data=data, ts=self.clock.now())
+        print_friendly_data = msg.data[1] if not isinstance(msg.data[1], np.ndarray) else msg.data[1][0, 0].tolist()
 
         if self.transport == TransportMode.QUEUE:
             # PUT() might block if maxsize exceeded
@@ -174,7 +174,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
             else:
                 raise TypeError("Data must implement SMCompliant for shared memory")
 
-        print(f"[MP Emitter] Emitted {data} at {msg.ts:.2f}\n")
+        print(f"[MP Emitter] Emitted {print_friendly_data} at {msg.ts:.2f}\n")
 
 
 class MultiprocessReceiver(SignalReceiver[T]):
@@ -185,6 +185,7 @@ class MultiprocessReceiver(SignalReceiver[T]):
         self.transport = transport
         self.sm_class = sm_class  # class to reconstruct shared memory object
         self.sm_args = sm_args
+        # TODO: instead of this add a sm_queue and get parameters like that - sm_name, buf_size, data_type, instantiation_params, idx = self._sm_queue.get_nowait()
 
     def read(self) -> Message[T] | None:
         try:
@@ -207,13 +208,25 @@ class MultiprocessReceiver(SignalReceiver[T]):
 # Control Loop primitives
 # ---------------------------------------------------------------------
 
+# helper function to check stop condition
+def should_stop(stop_event) -> bool:
+    """Universal stop condition checker for both LOCAL and PROCESS modes."""
+    if stop_event is None:
+        return False
+    elif hasattr(stop_event, 'is_set'):
+        return stop_event.is_set()
+    else:
+        return stop_event  # Simple boolean flag
+
+
 def sensor_loop_gen(stop_event: mp.Event, emitter: SignalEmitter, sensor: SensorSpec):
     """
     Generator (NOTE: it cannot be sent to a thread because of serialization issue, need a wrapper!)
      - permanently read one sensor and emit its reading to queue
      - return a command to be executed in main cooperative loop
     """
-    while not stop_event.is_set():
+
+    while not should_stop(stop_event):
         reading = sensor.read_fn()
         emitter.emit((sensor.id, reading))  # emits labeled reading as tuple
         yield Sleep(1.0)                    # loop voluntarily pauses, World gets control back
@@ -223,22 +236,25 @@ def controller_loop_gen(stop_event: mp.Event, receivers: List[SignalReceiver]):
     """
     Generator: for now a single controller handles all sensors
     """
-    while not stop_event.is_set():
+    while not should_stop(stop_event):
         # get last_reading from all sensors, do actions then ask to sleep for 10 sec
         for sensor_idx, receiver in enumerate(receivers):  # iterate all sensors
             msg = receiver.read()
             if msg:
                 sensor_name, value = msg.data
-                action = "COOL" if value > 25 else "HEAT"
-                # OPTIONAL: actuator_emitter.emit(action)
-                print(f"  [Controller] Sensor [{sensor_name}] reading: {value:.2f}, Action: {action}")
+                print(f"  [Controller] Sensor [{sensor_name}] reading: {value if not isinstance(value, np.ndarray) else value[0,0].tolist()}")
 
-        yield Sleep(10)      # loop voluntarily pauses, World gets control back
+                # We can make some actions here - send something to actuators for example
+                action = f'  ... here ACTION might be made based on {sensor_name} data above'
+                print(action)
+                # OPTIONAL: actuator_emitter.emit(action)
+
+        yield Sleep(5)      # World gets control back, controller asks to be read after 5 sec
 
 
 def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
     """
-     Needed because we cannot run sensor_loop_gen in a separate process
+     Needed because we cannot run sensor_loop_gen in a separate process (serialization issue)
     """
     generator_fn = sensor_loop_fn(stop_event, *args)
     try:
@@ -282,16 +298,12 @@ class World:
     def start(self, controller_loops, bg_loops):
         print("[world] is starting")
 
-        ### Start background loops (interprocess, not cooperative scheduled)
+        ### Start background interprocess loops
         for background_fn, args in bg_loops:
-            if PARALLELISM_TYPE == ParallelismType.PROCESS:
-                pr = mp.Process(target=_bg_wrapper_loop, args=(background_fn, self._stop_event, *args))
-                pr.start()
-                self.background_processes.append(pr)
-                print(f"[World] Started background process for {background_fn.__name__}")
-            else:
-                # TODO: implement it
-                raise ValueError(" LOCAL parallelism is not implemented yet")
+            pr = mp.Process(target=_bg_wrapper_loop, args=(background_fn, self._stop_event, *args))
+            pr.start()
+            self.background_processes.append(pr)
+            print(f"[World] Started background process for {background_fn.__name__}")
 
         #### Run main loop (cooperative scheduling -  coroutines) inside the main process
         try:                    # handle KeyboardInterrupt
@@ -321,7 +333,7 @@ class World:
 # Demo
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    PARALLELISM_TYPE = ParallelismType.LOCAL
+    PARALLELISM_TYPE = ParallelismType.MULTIPROCESS
 
     # Define sensors (with appropriate transport: queue or shared memory)
     sensor_specs: list[SensorSpec] = [
@@ -329,6 +341,8 @@ if __name__ == "__main__":
         SensorSpec(id="cloudy_sensor", dtype=str, read_fn=read_cloudiness, interval=2.0, transport=TransportMode.QUEUE),
         SensorSpec(id="camera", dtype=np.ndarray, read_fn=read_camera, interval=4, unit="frame", transport=TransportMode.SHARED_MEMORY),
     ]
+    if len([]) and (PARALLELISM_TYPE == ParallelismType.LOCAL):
+        raise ValueError(" On of the sensors has shared memory transfort, not possible in LOCAL mode")
 
     #### World Simulation
     world = World()         # CLOCK CREATED INSIDE WORLD to synchronize all sensors
@@ -336,26 +350,34 @@ if __name__ == "__main__":
     # create (emitter, receiver) pipe for sensors
     sensor_pipes: list[Tuple[SensorSpec, SignalEmitter, SignalReceiver]] = []
 
-    # TODO: need to deside here which pipes are Local and which are interprocess
-    # create background loops (for sensors)
-    emitter: MultiprocessEmitter
-    receiver: MultiprocessReceiver
     for sensor_spec in sensor_specs:
-        emitter, receiver = world.mp_pipe()
+        if PARALLELISM_TYPE == ParallelismType.LOCAL:
+            emitter, receiver = world.local_pipe()
+        else:
+            emitter, receiver = world.mp_pipe()
         sensor_pipes.append((sensor_spec, emitter, receiver))
 
-    bg_loops = [
+    sensor_loops = [
         (sensor_loop_gen, (emitter, spec)) for spec, emitter, _ in sensor_pipes
     ]
 
-    # create foregraund loops (for controller)
     receivers = [r for _, _, r in sensor_pipes]
     controller_loops = [
         (controller_loop_gen, (receivers,))
     ]
 
+    if PARALLELISM_TYPE == ParallelismType.LOCAL:
+        cooperative_loops = sensor_loops + controller_loops
+        bg_loops = []  # No background processes
+    elif PARALLELISM_TYPE == ParallelismType.MULTIPROCESS:
+        cooperative_loops = controller_loops
+        bg_loops = sensor_loops
+    else:
+        raise ValueError(" Wrong parallelism type")
+
+
     # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
-    world.start(controller_loops, bg_loops)
+    world.start(cooperative_loops, bg_loops)
 
 
 
