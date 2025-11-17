@@ -131,7 +131,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
     def emit(self, data: T) -> None:
         msg = Message(data=data, ts=self.clock.now())
-        # Emit appropriately
+
         if self.transport == TransportMode.QUEUE:
             self.queue.put(msg)
         elif self.transport == TransportMode.SHARED_MEMORY:
