@@ -1,14 +1,7 @@
 """
 Further development of cooperative scheduling loop, a minimum example.
 Here has been added:
- - interface classes with extensive typing
- - interprocess handling: a possibility to run heavy sensors interprocess, add stop signal
- - shared memory transport instead of queue for multiprocess communication
 
-New classes:
- - LocalQueueEmitter   -  Uses an in-memory `deque`
- - MultiprocessEmitter -  Uses `multiprocessing.Queue` or `shared memory`
- - TransportMode       -  which transport to use (queue or shared memory)
 """
 from abc import ABC, abstractmethod
 from collections import deque
