@@ -27,19 +27,17 @@ class Sleep:
 class Emitter:
     """Emitter that can send messages to several receivers (fan-out)."""
     def __init__(self):
-        self._queues: list[deque] = []
+        self._queue: deque | None = None
 
     def _bind(self, queue: deque):
-        self._queues.append(queue)
+        self._queue = queue
 
     def emit(self, data):
-        if not self._queues:
+        if self._queue is None:
             raise RuntimeError("Emitter not connected to any receiver")
         msg = Message(data)
-        for q in self._queues:
-            if len(q) < q.maxlen:
-                q.append(msg)
-            print(f"   --> Emitted {data}")
+        self._queue.append(msg)
+        print(f"   --> Emitted {data}")
 
 
 class Receiver:
@@ -61,7 +59,7 @@ class Receiver:
 
 
 # --- Control loops ----------------------------------------------------------
-def sensor_loop(stop_check: Callable[[], bool], emitter: Emitter, name: str) -> Iterator[Sleep]:
+def sensor_emitter_loop(stop_check: Callable[[], bool], emitter: Emitter, name: str) -> Iterator[Sleep]:
     """Sensor loop with generator, might be run a background process later."""
     while not stop_check():
         sensor_reading = random.randint(0, 100)
@@ -70,14 +68,15 @@ def sensor_loop(stop_check: Callable[[], bool], emitter: Emitter, name: str) -> 
     print(f"Sensor [{name}] Finished")
 
 
-def controller_loop(stop_check: Callable[[], bool], receiver: Receiver, name: str) -> Iterator[Sleep]:
+def controller_receiver_loop(stop_check: Callable[[], bool], receiver: Receiver, name: str) -> Iterator[Sleep]:
     """Foreground controller consuming messages cooperatively."""
     while not stop_check():
         msg = receiver.read()
         if msg:
             sensor_name, value = msg.data
-            print(f"Receiver [{name}] Got {value} from {sensor_name} (ts={msg.ts})")
+            print(f"Receiver [{name}] Got {value} from {sensor_name} (ts={msg.ts})", end='')
             # ACTION: take an action based on sensor reading, maybe emit another message
+            print("   ...do an ACTION based on sensor reading.")
         yield Sleep(5.0)    # Time is controlled here by individual loop not world!
     print(f"Controller [{name}] Finished")
 
@@ -96,7 +95,7 @@ class World:
     def is_stopped(self) -> bool:   # ← helper for readability
         return self._stop
 
-    def connect(self, emitter: Emitter, receiver: Receiver):
+    def local_pipe(self, emitter: Emitter, receiver: Receiver):
         queue = deque(maxlen=10)
         emitter._bind(queue)
         receiver._bind(queue)
@@ -107,40 +106,42 @@ class World:
         print("[World] Starting cooperative world... (Ctrl+C to stop)")
         try:
             # Initialize scheduling of the next reading
-            sensor_next_time = {loop: 0.0 for loop in sensor_loops}
-            controller_next_time = {loop: 0.0 for loop in controller_loops}
+            sensors_next_time = {s_loop: 0.0 for s_loop in sensor_loops}
+            controllers_next_time = {c_loop: 0.0 for c_loop in controller_loops}
 
             while not self._stop:
                 now = time.time()
 
-                # sensors loop might be run in separate thread/process in background, that is we separate them
-                #### Cooperative scheduling for sensors
+                # both loops might be joined into one,
+                # but I separated them to show that sensors might be run as processes/threads
+
+                #### Cooperative scheduling for sensors (emitters)
                 for s_loop in sensor_loops:
-                    if now >= sensor_next_time[s_loop]:     # read only if its time has come
+                    if now >= sensors_next_time[s_loop]:     # read sensor only if its time has come
                         try:
                             command = next(s_loop)
                             if isinstance(command, Sleep):
-                                sensor_next_time[s_loop] = now + command.seconds
+                                sensors_next_time[s_loop] = now + command.seconds
                             else:
                                 raise ValueError(f"Unexpected command: {command}")
                         except StopIteration:
-                            # generator finished (provide no more iterations) - remove it from the list
-                            sensor_next_time.pop(s_loop, None)
+                            # generator finished (provides no more iterations) - remove it from the list
+                            sensors_next_time.pop(s_loop, None)
                             sensor_loops.remove(s_loop)
                             continue
 
-                #### Cooperative scheduling for controllers
+                #### Cooperative scheduling for controllers (receivers)
                 for c_loop in controller_loops:
-                    if now >= controller_next_time[c_loop]:
+                    if now >= controllers_next_time[c_loop]:
                         try:
                             command = next(c_loop)
                             if isinstance(command, Sleep):
-                                controller_next_time[c_loop] = now + command.seconds
+                                controllers_next_time[c_loop] = now + command.seconds
                             else:
                                 raise ValueError(f"Unexpected command: {command}")
                         except StopIteration:
                             # generator finished (provide no more iterations) - remove it from the list
-                            controller_next_time.pop(c_loop, None)
+                            controllers_next_time.pop(c_loop, None)
                             controller_loops.remove(c_loop)
                             continue
 
@@ -167,18 +168,18 @@ if __name__ == "__main__":
     lidar_controller = Receiver()
 
     # Connect emitters to receivers
-    world.connect(camera, camera_controller)
-    world.connect(lidar, lidar_controller)
+    world.local_pipe(camera, camera_controller)
+    world.local_pipe(lidar, lidar_controller)
 
     # Define coroutines
     sensor_loops = [
-        sensor_loop(world.is_stopped, camera, "CameraSensor"),
-        sensor_loop(world.is_stopped, lidar, "LidarSensor"),
+        sensor_emitter_loop(world.is_stopped, camera, "CameraSensor"),
+        sensor_emitter_loop(world.is_stopped, lidar, "LidarSensor"),
     ]
 
     controller_loops = [
-        controller_loop(world.is_stopped, camera_controller, "CameraController"),
-        controller_loop(world.is_stopped, lidar_controller, "LidarController"),
+        controller_receiver_loop(world.is_stopped, camera_controller, "CameraController"),
+        controller_receiver_loop(world.is_stopped, lidar_controller, "LidarController"),
     ]
 
     # Run everything cooperatively in one thread

@@ -368,6 +368,7 @@ class World:
         self._stop_event = mp.Event()
         self.background_processes = []
         self.clock = Clock()
+        self._connections = []
 
     def _keypress_watcher(self):
         print("[World] Press any key to stop simulation...")
