@@ -1,6 +1,8 @@
 """
-Further development of cooperative scheduling loop, a minimum example.
-Here has been added:
+Further development of cooperative scheduling loop.
+Here it has been added:
+  - running sensors in a separate process
+  - interprocess shared memory and queue transport
 
 """
 from abc import ABC, abstractmethod
@@ -23,7 +25,7 @@ T = TypeVar("T")
 class Message(Generic[T]):
     data: T
     ts: float
-    updated: bool = True
+    updated: bool = True    # is data new since the last read? Set by receiver
 
 
 class TransportMode(IntEnum):
@@ -42,16 +44,13 @@ class Sleep:
 
 
 class Clock:
-    def now(self) -> float:
-        return time.time()
-
     def now_ns(self) -> int:
         return time.time_ns()
 
 
 ### SM: Shared Memory Support
 class SMCompliant(ABC):
-    """Any data to be sent to shared memory should comply"""
+    """Any data to be sent to shared memory should comply, i.e. be able to serialize"""
 
     @abstractmethod
     def buf_size(self) -> int:
@@ -73,34 +72,36 @@ class SMCompliant(ABC):
 
 
 class NumpySMAdapter(SMCompliant):
-    """Adapter for single numpy array."""
+    """
+    Adapter between a NumPy array and a shared-memory (SM) communication block.
+    It does not allocate SM, it only knows how to copy to/from a buffer
+    """
     def __init__(self, shape: tuple[int, ...], dtype: np.dtype):
+        """Array to be mapped to SM block"""
         self.array = np.empty(shape, dtype=dtype)
-
-    def instantiation_params(self) -> tuple:
-        """
-        Receiving class expects AdapterClass(*adapter.instantiation_params()) to reconstruct the same array
-        the data will be filled from shared memory then
-        """
-        return (self.array.shape, self.array.dtype)
-
-    def buf_size(self) -> int:
-        return self.array.nbytes
-
-    def set_to_buffer(self, buffer: memoryview | bytearray) -> None:
-        # copy raw bytes into the target buffer
-        buffer[:self.array.nbytes] = self.array.tobytes()
-
-    def read_from_buffer(self, buffer: memoryview | bytes) -> None:
-        self.array[:] = np.frombuffer(buffer[:self.array.nbytes], dtype=self.array.dtype).reshape(self.array.shape)
 
     @staticmethod
     def lazy_init(array: np.ndarray, adapter: 'NumpySMAdapter | None') -> 'NumpySMAdapter':
         """Lazily initialize adapter and copy array data."""
         if adapter is None:
             adapter = NumpySMAdapter(array.shape, array.dtype)
-        adapter.array[:] = array
+        adapter.array[:] = array    # copy new data: equivalent to np.copyto(adapter.array, array)
         return adapter
+
+    def instantiation_params(self) -> tuple:
+        """ Receiving class it to reconstruct the same array """
+        return (self.array.shape, self.array.dtype)
+
+    def buf_size(self) -> int:
+        return self.array.nbytes
+
+    def set_to_buffer(self, buffer: memoryview | bytearray) -> None:
+        # copy raw bytes into the shared memory buffer
+        buffer[:self.array.nbytes] = self.array.tobytes()
+
+    def read_from_buffer(self, buffer: memoryview | bytes) -> None:
+        # a temporary view pointing to the data from SM
+        self.array[:] = np.frombuffer(buffer[:self.array.nbytes], dtype=self.array.dtype).reshape(self.array.shape)
 
 
 
@@ -144,7 +145,7 @@ class CameraSensor(Sensor):
         self.width = width
         self.height = height
         self.unit = "frame"
-        self._adapter: NumpySMAdapter | None = None     # reuse same adapter
+        self._adapter: NumpySMAdapter | None = None
 
     def read(self) -> NumpySMAdapter:
         frame = np.random.randint(0, 256, (self.height, self.width, 3), dtype=np.uint8)
@@ -152,7 +153,7 @@ class CameraSensor(Sensor):
         return self._adapter
 
 
-#### Interfaces
+######### Emitters / Receivers
 class SignalEmitter(Generic[T]):
     def emit(self, data: T) -> bool:
         """Add data to a queue as a Message"""
@@ -164,8 +165,6 @@ class SignalReceiver(Generic[T]):
         ...
 
 
-
-####### Emitters / Receivers implementation, Local and interprocess
 class LocalQueueEmitter(SignalEmitter[T]):
     def __init__(self, queue: deque, clock: Clock):
         self.queue = queue
@@ -183,7 +182,7 @@ class LocalQueueEmitter(SignalEmitter[T]):
 class LocalQueueReceiver(SignalReceiver[T]):
     def __init__(self, queue: deque):
         self.queue = queue
-        self.last_msg = None    # imagine sensor emits data every 2 seconds, but control loop runs every 0.1 seconds
+        self.last_msg = None    # if no new data, emit the last message
 
     def read(self) -> Message[T] | None:
         if self.queue:
@@ -197,12 +196,12 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
     def __init__(self,
                  transport: TransportMode,
-                 queue: mp.Queue,
+                 queue: mp.Queue,               # use for QUEUE transport
                  clock: Clock,
                  lock: mp.Lock = None,
                  ts_value: mp.Value = None,     # time of emitting fresh value
-                 up_value: mp.Value = None,     # flaf of fresh SM block
-                 sm_queue: mp.Queue = None):    # extra SM metadata queue
+                 up_value: mp.Value = None,     # for SM: flag of fresh SM block
+                 sm_queue: mp.Queue = None):    # for SM: SM metadata queue
         self.transport = transport
         self.queue = queue
         self.clock = clock
@@ -216,14 +215,17 @@ class MultiprocessEmitter(SignalEmitter[T]):
         self._expected_buf_size: int | None = None
 
     def _emit_queue(self, data: T, ts: float) -> bool:
-        """Send via regular queue."""
+        """
+        Send via regular queue.
+        Not too efficiant for camera data, every frame must go via queue
+        """
         msg = Message(data=data, ts=ts)
         try:
             self.queue.put_nowait(msg)
             return True
         except Full:
             try:
-                self.queue.get_nowait()
+                self.queue.get_nowait()     # drop the oldest of queue is full
                 self.queue.put_nowait(msg)
                 return True
             except (Empty, Full):
@@ -231,25 +233,22 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
     def _emit_shared_memory(self, data: SMCompliant, ts: float) -> bool:
         """Send via shared memory."""
-        # Validate data type
         assert isinstance(data, SMCompliant), f"SHARED_MEMORY mode requires SMCompliant data, got {type(data)}"
-
         buf_size = data.buf_size()
 
         # First time: create buffer and send metadata
         if self._sm is None:
             self._expected_buf_size = buf_size
             self._sm = shared_memory.SharedMemory(create=True, size=buf_size)
+            sm_metadata = (
+                self._sm.name,
+                buf_size,
+                type(data),
+                data.instantiation_params())
+            self.sm_queue.put(sm_metadata)      # send SM metadata
+            print(f"[Emitter] Created SM buffer and sent a first data to it: {self._sm.name}, size={buf_size}")
 
-            # Send metadata once
-            metadata = (self._sm.name, buf_size, type(data),
-                        data.instantiation_params())
-            self.sm_queue.put(metadata)
-            print(f"[Emitter] Created SM buffer: {self._sm.name}, size={buf_size}")
-
-        # Verify size consistency
-        assert buf_size == self._expected_buf_size, \
-            f"Buffer size changed: {buf_size} != {self._expected_buf_size}"
+        assert buf_size == self._expected_buf_size, f"Buffer size changed: {buf_size} != {self._expected_buf_size}"
 
         # Write data with lock
         with self.lock:
@@ -266,7 +265,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
 
         if self.transport == TransportMode.SHARED_MEMORY:
             self._emit_shared_memory(data, ts)
-        else:                           # TransportMode.QUEUE
+        else:
             self._emit_queue(data, ts)
 
     def close(self) -> None:
@@ -276,7 +275,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
                 self._sm.close()    # stop using it
                 self._sm.unlink()   # tell OS to delete the block
             except:
-                pass    # process might not own the SM (only the creator should unlink)
+                pass
 
 
 class MultiprocessReceiver(SignalReceiver[T]):
@@ -296,7 +295,7 @@ class MultiprocessReceiver(SignalReceiver[T]):
         self.up_value = up_value
         self.sm_queue = sm_queue
         self._sm: shared_memory.SharedMemory | None = None
-        self._out_value: SMCompliant | None = None          # whether it already attached
+        self._out_value: SMCompliant | None = None    # buffer that will hold the latest data read from shared memory
         self._readonly_buffer: memoryview | None = None
 
         self.last_msg: Message[T] | None = None
@@ -313,28 +312,24 @@ class MultiprocessReceiver(SignalReceiver[T]):
 
         # Reads metadata from a queue
         try:
-            # data_type: class that interprets the bytes,
-            # instantiation_params: parameters for that class
+            # data_type: class that interprets the bytes, NumpySMAdapter
+            # instantiation_params: size of numpy array
             sm_name, buf_size, data_type, instantiation_params = self.sm_queue.get_nowait()
-        except Empty:   # queue is empty
+        except Empty:
             return False
 
         # Attach Receiver to existing shared memory
         self._sm = shared_memory.SharedMemory(name=sm_name)
 
-        # The creator process is responsible for unlinking it, not the receiver - so we only attach to it!
+        # The creator process is responsible for unlinking it, not the receiver
         try:
             resource_tracker.unregister(self._sm._name, 'shared_memory')
         except:
             pass
 
-        # Create read-only view (so this receiver can't modify shared data)
+        # in case buffer is slightly larger than requested;
         self._readonly_buffer = self._sm.buf.toreadonly()[:buf_size]
-
-        # Instantiates a local object that knows how to interpret the shared buffer
-        # reuse self._out_value
-        self._out_value = data_type(*instantiation_params) if self._out_value is None else self._out_value
-        self._out_value.read_from_buffer(self._readonly_buffer)
+        self._out_value = data_type(*instantiation_params)
 
         print(f"[Receiver] Attached to SM: {sm_name}")
         return True
@@ -376,7 +371,7 @@ class MultiprocessReceiver(SignalReceiver[T]):
     def read(self) -> Message[T] | None:
         if self.transport == TransportMode.SHARED_MEMORY:
             return self._read_shared_memory()
-        else:  # TransportMode.QUEUE
+        else:
             return self._read_queue()
 
     def close(self) -> None:
@@ -385,8 +380,9 @@ class MultiprocessReceiver(SignalReceiver[T]):
         if self._sm is not None:
             self._sm.close()
 
+
 # ---------------------------------------------------------------------
-# Control Loop primitives
+# Control Loops
 # ---------------------------------------------------------------------
 
 # helper function to check stop condition
@@ -401,11 +397,10 @@ def should_stop(stop_event) -> bool:
 
 def sensor_loop_gen(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sensor):
     """
-    Generator (NOTE: it cannot be sent to a thread because of serialization issue, need a wrapper!)
-     - permanently read one sensor and emit its reading to queue
-     - return a command to be executed in main cooperative loop
+    Generator (NOTE: it cannot be sent to a thread because of serialization issue, needs a wrapper!)
+     - permanently read one sensor and emit its reading into queue or shared memory
+     - return a command to be executed in main cooperative loop (Sleep)
     """
-
     while not should_stop(stop_event):
         reading = sensor.read()
         emitter.emit(reading)
@@ -413,10 +408,10 @@ def sensor_loop_gen(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sensor
 
 
 def controller_loop_gen(stop_event: mp.Event,
-                        sensor_receivers: List[Tuple[Sensor, SignalReceiver]]):
+                        sensor_controllers: List[Tuple[Sensor, SignalReceiver]]):
     """Controller loop - reads from sensors and acts."""
     while not should_stop(stop_event):
-        for sensor, receiver in sensor_receivers:
+        for sensor, receiver in sensor_controllers:
             msg = receiver.read()
             if msg:
                 value = msg.data
@@ -426,8 +421,7 @@ def controller_loop_gen(stop_event: mp.Event,
                     value = value.array
 
                 # Format display value
-                display_value = value if not isinstance(value, np.ndarray) \
-                    else f"array[0,0]={value[0, 0]}"
+                display_value = value if not isinstance(value, np.ndarray) else f"array[0,0]={value[0, 0]}"
 
                 status = "FRESH" if msg.updated else "STALE"
                 print(f"  [Controller] {sensor.sensor_id}: {display_value} [{status}]")
@@ -462,7 +456,6 @@ class World:
         self._stop_event = mp.Event()
         self.background_processes = []
         self.clock = Clock()
-
         self._manager = mp.Manager()
         self._cleanup_resources = []
 
@@ -559,6 +552,7 @@ if __name__ == "__main__":
         CloudinessSensor(sensor_id="cloudy_sensor", transport=TransportMode.QUEUE),
         CameraSensor(sensor_id="camera", transport=TransportMode.SHARED_MEMORY),
     ]
+
     # VALIDATION: Ensure SM only used in MULTIPROCESS mode
     sm_sensors = [s for s in sensors
                   if s.transport == TransportMode.SHARED_MEMORY]
@@ -585,10 +579,11 @@ if __name__ == "__main__":
         for sensor, emitter, _ in sensor_pipes
     ]
 
-    sensor_receivers = [(sensor, receiver) for sensor, _, receiver in sensor_pipes]
+    sensor_controllers = [(sensor, receiver) for sensor, _, receiver in sensor_pipes]
     controller_loops = [
-        (controller_loop_gen, (sensor_receivers,))  # ← Use sensor_receivers, not receivers
+        (controller_loop_gen, (sensor_controllers,))  # Use sensor_receivers, not receivers
     ]
+
 
     if PARALLELISM_TYPE == ParallelismType.LOCAL:
         cooperative_loops = sensor_loops + controller_loops
