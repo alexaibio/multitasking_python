@@ -145,7 +145,10 @@ class World:
                             controller_loops.remove(c_loop)
                             continue
 
-                # Prevent tight CPU spin
+
+                # NOTE: this approach is not too optimal:
+                #   loop is spinning regardless of scheduled next time reading
+                #   so we need to prevent tight CPU spin by this small sleep
                 time.sleep(0.01)
 
         except KeyboardInterrupt:

@@ -163,6 +163,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
         msg = Message(data=data, ts=ts)
         try:
             self.queue.put_nowait(msg)
+            print("[Multiprocess Emitter]: Data emitted to QUEUE")
             return True
         except Full:
             try:
@@ -173,7 +174,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
                 return False
 
     def _emit_shared_memory(self, data: SMCompliant, ts: float) -> bool:
-        """Send via shared memory."""
+        """Send via shared memory, marking all receivers as needing update."""
         assert isinstance(data, SMCompliant), f"SHARED_MEMORY mode requires SMCompliant data, got {type(data)}"
         buf_size = data.buf_size()
 
@@ -187,7 +188,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
                 type(data),
                 data.instantiation_params())
             self.sm_queue.put(sm_metadata)      # send SM metadata
-            print(f"      [Emitter] Created SM buffer and sent its metadata: {self._sm.name}, size={buf_size}")
+            print(f"      [Multiprocess Emitter] Created SM buffer and sent its metadata: {self._sm.name}, size={buf_size}")
 
         assert buf_size == self._expected_buf_size, f"Buffer size changed: {buf_size} != {self._expected_buf_size}"
 
@@ -199,6 +200,8 @@ class MultiprocessEmitter(SignalEmitter[T]):
             self.ts_value.value = int(ts)
             self.up_value.value = True
 
+        print("[Multiprocess Emitter]: Data emitted to Shared Memory")
+
         return True
 
     def emit(self, data: T) -> None:
@@ -209,7 +212,7 @@ class MultiprocessEmitter(SignalEmitter[T]):
             self._emit_shared_memory(data_sm, ts)
         else:
             self._emit_queue(data, ts)
-        print(f"[Emitter] Data is emitted")
+
 
     def close(self) -> None:
         """Clean up shared memory."""
@@ -290,10 +293,6 @@ class MultiprocessReceiver(SignalReceiver[T]):
             return None
 
     def _read_shared_memory(self) -> Message[T] | None:
-        # Check if anything was written yet
-        with self.lock:
-            if self.ts_value.value == -1:
-                return None
 
         # Initialize if needed
         if not self._ensure_shared_memory_initialized():
@@ -301,7 +300,16 @@ class MultiprocessReceiver(SignalReceiver[T]):
 
         # Read with lock
         with self.lock:
+            if self.ts_value.value == -1:
+                return None
+
+            assert self._readonly_buffer is not None
+            assert self._out_value is not None
+
+            # read buffer
             self._out_value.read_from_buffer(self._readonly_buffer)
+
+            # Determine if data is fresh
             updated = self.up_value.value
             self.up_value.value = False
 
@@ -354,7 +362,7 @@ def sensor_loop_gen_fn(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sen
 
 def controller_loop_gen_fn(stop_event: mp.Event,
                            receivers: List[Tuple[Sensor, SignalReceiver]]):
-    """Controller loop - reads from sensors and acts."""
+    """Controller loop - reads from all receivers cooperatively, act then wait."""
     while not should_stop(stop_event):
         # read all sensors once
         for sensor, receiver in receivers:
@@ -367,7 +375,6 @@ def controller_loop_gen_fn(stop_event: mp.Event,
                     value = value.array
 
                 display_value = value if not isinstance(value, np.ndarray) else f"array[0,0]={value[0, 0]}"
-
                 status = "FRESH" if msg.updated else "STALE"
                 print(f"[Controller] {sensor.sensor_id} received: {display_value} [{status}]", end='')
 
@@ -386,7 +393,7 @@ def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
     try:
         for command in generator_fn:
             if isinstance(command, Sleep):
-                stop_event.wait(command.seconds)    #  until the event is set, or timeout seconds have passed
+                time.sleep(command.seconds)
             else:
                 raise ValueError(f'Unknown command: {command}')
     except KeyboardInterrupt:
@@ -395,161 +402,6 @@ def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
         print(f"[Background] Stopping {sensor_loop_fn.__name__} with {args[1].sensor_id} inside")
 
 
-# ---------------------------------------------------------------------
-class World:
-    """ Scheduler: orchestrating control loops """
-    def __init__(self):
-        self._stop_event = mp.Event()
-        self.background_processes = []
-        self.clock = Clock()
-        self._manager = mp.Manager()
-        self._cleanup_resources = []
-
-    def local_pipe(self):
-        """ Create data queue and assign it to both emitter and receiver """
-        q = deque(maxlen=5)
-        emitter = LocalQueueEmitter(q, self.clock)
-        receiver = LocalQueueReceiver(q)
-        return emitter, receiver
-
-    # create interprocess pipe
-    def mp_pipe(self, transport: TransportMode):
-        message_queue = self._manager.Queue(maxsize=5)
-
-        if transport == TransportMode.SHARED_MEMORY:
-            # Create SM primitives
-            lock = self._manager.Lock()
-            ts_value = self._manager.Value('Q', -1)
-            up_value = self._manager.Value('b', False)
-            sm_queue = self._manager.Queue()
-
-            emitter = MultiprocessEmitter(
-                transport, message_queue, self.clock,
-                lock, ts_value, up_value, sm_queue
-            )
-            receiver = MultiprocessReceiver(
-                transport, message_queue,
-                lock, ts_value, up_value, sm_queue
-            )
-        else:  # TransportMode.QUEUE
-            emitter = MultiprocessEmitter(
-                transport, message_queue, self.clock
-            )
-            receiver = MultiprocessReceiver(
-                transport, message_queue
-            )
-
-        self._cleanup_resources.append((emitter, receiver))
-        return emitter, receiver
-
-    @property
-    def should_stop(self) -> bool:
-        return self._stop_event.is_set()
-
-    def start(self, fg_loops, bg_loops):
-        print(f"[world] is starting")
-
-        ### Start background interprocess loops
-        for background_fn, args in bg_loops:
-            pr = mp.Process(target=_bg_wrapper_loop, args=(background_fn, self._stop_event, *args))
-            pr.start()
-            self.background_processes.append(pr)
-            print(f"[World] Started background process for {args[1].sensor_id}, {args[1].transport.name}")
-
-        #### Run main loop (cooperative scheduling - coroutines) inside the main process
-        try:                    # handle KeyboardInterrupt
-            # create all generators
-            generators = [
-                cooperative_fn(self._stop_event, *args)
-                for cooperative_fn, args in fg_loops
-            ]
-            while not self._stop_event.is_set():
-                # allows handling multiple controllers (whole system)
-                for gen in generators:
-                    try:        # handle StopIteration when generator finishes
-                        command = next(gen)
-                        # execute command: might also be Stor, Log - only control flow commands not actuators
-                        if isinstance(command, Sleep):
-                            time.sleep(command.seconds)
-                        else:
-                            raise ValueError(f" Wrong command {command}")
-                    except StopIteration:
-                        print(f'...Control loop generator  {gen} stopped')
-                        continue
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print("[World] Stopping... sending stop_event")
-            self._stop_event.set()
-
-            # Cleanup
-            for emitter, receiver in self._cleanup_resources:
-                emitter.close()     # clean up shared memory
-                receiver.close()
-            print("  ... Shared memory released by all emitters and receivers")
-
-            print("  ... joining each bg process to let stop_event make effect")
-            for pr in self.background_processes:
-                pr.join()
-
-
-# ---------------------------------------------------------------------
-# Demo
-# ---------------------------------------------------------------------
-if __name__ == "__main__":
-    PARALLELISM_TYPE = ParallelismType.MULTIPROCESS
-
-    sensors: list[Sensor] = [
-        TemperatureSensor(transport=TransportMode.QUEUE, interval=1.0),
-        CloudinessSensor(transport=TransportMode.QUEUE, interval=5.0),
-        #CameraSensor(transport=TransportMode.QUEUE, interval=2.0)
-        CameraSensor(transport=TransportMode.SHARED_MEMORY, interval=2.0)
-    ]
-
-    # Ensure SM only used in MULTIPROCESS mode
-    if PARALLELISM_TYPE == ParallelismType.LOCAL and (
-            wrong_s := [s for s in sensors if s.transport==TransportMode.SHARED_MEMORY]):
-        raise ValueError(f"SHARED_MEMORY transport not allowed in LOCAL mode for {[s.sensor_id for s in wrong_s]}")
-
-
-
-    #### World Simulation
-    world = World()         # CLOCK CREATED INSIDE WORLD to synchronize all sensors
-
-    # create all pipes between two sensors (emitter -> receiver)
-    pipes: list[Tuple[Sensor, SignalEmitter, SignalReceiver]] = []
-    for sensor in sensors:
-        if PARALLELISM_TYPE == ParallelismType.LOCAL:
-            emitter, receiver = world.local_pipe()
-        else:
-            emitter, receiver = world.mp_pipe(sensor.transport)
-        pipes.append((sensor, emitter, receiver))
-
-    # list of nessesary emitting loops
-    emitting_loops = [
-        (sensor_loop_gen_fn, (emitter, sensor))
-        for sensor, emitter, _ in pipes
-    ]
-
-    # just on controller cooperative loop with all receivers in it
-    receivers = [(sensor, receiver) for sensor, _, receiver in pipes]
-    controller_loop = [
-        (controller_loop_gen_fn, (receivers,))
-    ]
-
-    # decide what to run in background or foreground
-    if PARALLELISM_TYPE == ParallelismType.LOCAL:
-        cooperative_loops = emitting_loops + controller_loop
-        bg_loops = []   # No background processes
-    elif PARALLELISM_TYPE == ParallelismType.MULTIPROCESS:
-        cooperative_loops = controller_loop
-        bg_loops = emitting_loops
-    else:
-        raise ValueError(" Wrong parallelism type")
-
-
-    # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
-    world.start(cooperative_loops, bg_loops)
 
 
 
