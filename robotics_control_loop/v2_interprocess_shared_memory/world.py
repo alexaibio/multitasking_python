@@ -16,7 +16,7 @@ from interprocess_shared_memory import (
     Clock, Sleep, TransportMode, ParallelismType,
     Sensor, CloudinessSensor, TemperatureSensor, CameraSensor,
     SignalEmitter, SignalReceiver, LocalQueueReceiver, LocalQueueEmitter, MultiprocessEmitter, MultiprocessReceiver,
-    _bg_wrapper_loop, sensor_loop_gen_fn, controller_loop_gen_fn
+    _bg_wrapper_loop, sensor_gen_fn, controller_gen_fn
 )
 
 
@@ -45,8 +45,8 @@ class World:
             # Create SM primitives
             lock = self._manager.Lock()
             ts_value = self._manager.Value('Q', -1)
-            up_value = self._manager.Value('b', False)
-            sm_queue = self._manager.Queue()
+            up_value = self._manager.Value('b', False)  # a flag that SM block has a new FRESH value
+            sm_queue = self._manager.Queue()            # a separate queue to send Shared Memory metadata
 
             emitter = MultiprocessEmitter(
                 transport, message_queue, self.clock,
@@ -64,7 +64,7 @@ class World:
                 transport, message_queue
             )
 
-        self._cleanup_resources.append((emitter, receiver))
+        self._cleanup_resources.append((emitter, receiver))     # we need to clean shared memory at the end
         return emitter, receiver
 
     @property
@@ -128,8 +128,8 @@ class World:
             self.background_processes.append(pr)
             print(f"[World] Started background process for {args[1].sensor_id}, {args[1].transport.name}")
 
-        #### Run main loop (cooperative scheduling - coroutines) inside the main process
-        try:         # if KeyboardInterrupt stop all processes
+        #### Run foreground cooperative scheduling loop inside the main process
+        try:         # if KeyboardInterrupt -> stop and clean all processes
             generators = [
                 cooperative_fn(self._stop_event, *args)
                 for cooperative_fn, args in fg_loops
@@ -142,12 +142,13 @@ class World:
 
             # First scheduling: start all generators immediately
             for gen in generators:
-                heapq.heappush(priority_queue,(now, counter, gen))
+                priority_queue.append((now, counter, gen))
                 counter += 1
+            heapq.heapify(priority_queue)
 
             ######################
             while priority_queue and not self._stop_event.is_set():
-                # next coroutine scheduled to run
+                # get the closest scheduled gen
                 next_time, _, gen = heapq.heappop(priority_queue)
 
                 # wait until its scheduled execution time
@@ -157,7 +158,7 @@ class World:
                 if wait_ns > 0:
                     time.sleep(wait_ns / 1e9)
 
-                command = next(gen)
+                command = next(gen)     # advance current generator (read sensor)
                 if not isinstance(command, Sleep):
                     raise ValueError(f"Unexpected command {command}")
 
@@ -190,27 +191,27 @@ class World:
 # Demo
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    PARALLELISM_TYPE = ParallelismType.LOCAL
+    PARALLELISM_TYPE = ParallelismType.MULTIPROCESS     # LOCAL / MULTIPROCESS
 
     sensors: list[Sensor] = [
         TemperatureSensor(transport=TransportMode.QUEUE, interval=5.0),
         CloudinessSensor(transport=TransportMode.QUEUE, interval=10.0),
-        CameraSensor(transport=TransportMode.QUEUE, interval=1.0)
-        #CameraSensor(transport=TransportMode.SHARED_MEMORY, interval=1.0)
+        #CameraSensor(transport=TransportMode.QUEUE, interval=1.0)
+        CameraSensor(transport=TransportMode.SHARED_MEMORY, interval=1.0)
     ]
 
-    # Ensure SM only used in MULTIPROCESS mode
+    # Sanity check: Ensure SM only used in MULTIPROCESS mode
     if PARALLELISM_TYPE == ParallelismType.LOCAL and (
             wrong_s := [s for s in sensors if s.transport==TransportMode.SHARED_MEMORY]):
         raise ValueError(f"SHARED_MEMORY transport not allowed in LOCAL mode for {[s.sensor_id for s in wrong_s]}")
 
 
 
-    #### World Simulation
-    clk = Clock()       # might use a custom clock
+    #### create World environment
+    clk = Clock()       # we might use a custom clock
     world = World(clk)
 
-    # create all pipes between two sensors (emitter -> receiver)
+    # create pipes between sensor and controller (emitter -> receiver)
     pipes: list[Tuple[Sensor, SignalEmitter, SignalReceiver]] = []
     for sensor in sensors:
         if PARALLELISM_TYPE == ParallelismType.LOCAL:
@@ -219,16 +220,16 @@ if __name__ == "__main__":
             emitter, receiver = world.mp_pipe(sensor.transport)
         pipes.append((sensor, emitter, receiver))
 
-    # list of nessesary emitting loops
+    # list of necessary emitting loops
     emitting_loops = [
-        (sensor_loop_gen_fn, (emitter, sensor))
+        (sensor_gen_fn, (emitter, sensor))
         for sensor, emitter, _ in pipes
     ]
 
-    # just on controller cooperative loop with all receivers in it
+    # Single controller loop with all receivers in it (because it is always a cooperative loop)
     receivers = [(sensor, receiver) for sensor, _, receiver in pipes]
     controller_loop = [
-        (controller_loop_gen_fn, (receivers,))
+        (controller_gen_fn, (receivers,))
     ]
 
     # decide what to run in background or foreground

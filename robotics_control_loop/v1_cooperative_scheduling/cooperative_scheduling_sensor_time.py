@@ -161,14 +161,16 @@ class World:
 # --- Main simulation --------------------------------------------------------
 
 if __name__ == "__main__":
-    world = World()
-
-    # Create emitters and receivers
+    # Create emitters (Sensors) and receivers (Controllers)
     camera = Emitter()
     lidar = Emitter()
 
     camera_controller = Receiver()
     lidar_controller = Receiver()
+
+
+    # create an environment (World)
+    world = World()
 
     # Connect emitters to receivers
     world.local_pipe(camera, camera_controller)

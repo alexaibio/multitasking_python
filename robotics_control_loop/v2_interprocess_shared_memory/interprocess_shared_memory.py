@@ -346,7 +346,7 @@ def should_stop(stop_event) -> bool:
         return stop_event
 
 
-def sensor_loop_gen_fn(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sensor):
+def sensor_gen_fn(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sensor):
     """
     Generator (NOTE: it cannot be sent to a thread because of serialization issue, needs a wrapper!)
      - permanently read one sensor and emit its reading into queue or shared memory
@@ -360,8 +360,8 @@ def sensor_loop_gen_fn(stop_event: mp.Event, emitter: SignalEmitter, sensor: Sen
     print("[Sensor] loop ended.", flush=True)
 
 
-def controller_loop_gen_fn(stop_event: mp.Event,
-                           receivers: List[Tuple[Sensor, SignalReceiver]]):
+def controller_gen_fn(stop_event: mp.Event,
+                      receivers: List[Tuple[Sensor, SignalReceiver]]):
     """Controller loop - reads from all receivers cooperatively, act then wait."""
     while not should_stop(stop_event):
         # read all sensors once
@@ -381,15 +381,17 @@ def controller_loop_gen_fn(stop_event: mp.Event,
                 if msg.updated:
                     print(f"    → Action required based on {sensor.sensor_id} reading")
 
-        yield Sleep(5)      # Give control back to the world
+        yield Sleep(5)      # Give control back to the world - do all readings every 5 sec
     print("[Controller] loop ended.")
 
 
-def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
+def _bg_wrapper_loop(sensor_gen_fn, stop_event, *args):
     """
-     Needed because we cannot run sensor_loop_gen in a separate process (serialization issue)
+     Needed because
+      - we need to loop generator inside a separate process
+      - we cannot run sensor_loop_gen in a separate process (serialization issue)
     """
-    generator_fn = sensor_loop_fn(stop_event, *args)
+    generator_fn = sensor_gen_fn(stop_event, *args)
     try:
         for command in generator_fn:
             if isinstance(command, Sleep):
@@ -397,9 +399,13 @@ def _bg_wrapper_loop(sensor_loop_fn, stop_event, *args):
             else:
                 raise ValueError(f'Unknown command: {command}')
     except KeyboardInterrupt:
+        # silently handle in bg process
         pass
+    except Exception:
+        print("Error in background process")
     finally:
-        print(f"[Background] Stopping {sensor_loop_fn.__name__} with {args[1].sensor_id} inside")
+        print(f"[Background] Stopping {sensor_gen_fn.__name__} with {args[1].sensor_id} inside")
+        stop_event.set()
 
 
 
