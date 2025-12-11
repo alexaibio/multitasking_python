@@ -16,7 +16,7 @@ That approach works, but it has several drawbacks. For example, each sensor may 
 - [Cooperative Scheduling](#cooperative-scheduling)
   - [How Cooperative Scheduling Is Organized Programmatically](#how-cooperative-scheduling-is-organized-programmatically)
 - [Combining Cooperative Scheduling with Multiprocessing](#combining-cooperative-scheduling-with-multiprocessing)
-- [Examples](#examples)
+- [How Data Exchange via Shared Memory Is Implemented](#How-Data-Exchange-via-Shared-Memory-Is-Implemented)
 
 
 ## Cooperative scheduling
@@ -39,9 +39,8 @@ Note that Sleep command is not an actual OS sleep — it’s an instruction inte
 
 Overall, in each loop iteration, every sensor sends both:
 
-Its reading (e.g., temperature = 22.4°C), and
-
-A command, like Sleep(2), meaning “wait 2 seconds before asking me again.”
+- Its reading (e.g., temperature = 22.4°C), and
+- A command, like Sleep(2), meaning “wait 2 seconds before asking me again.”
 
 Since the sensor loop is organized as a generator, it stops at the yield Sleep(1) statement, gives control back to the controller loop, and waits until the controller resumes it for the next iteration.
 This means the sensor is not running on every tick (loop iteration) — avoiding unnecessary energy and CPU consumption — but only when necessary for that specific sensor.
@@ -57,4 +56,14 @@ Now, let's try to scale this approach up a little and demonstrate how a larger s
 
 In principle, the camera could also use a multiprocessing queue. However, since it sends a large amount of data every second, the overhead of using a queue would be enormous. Therefore, using shared memory is a more efficient way to handle such a high data throughput between processes.
 
-The full example is here - https://github.com/alexaibio/multitasking_python/tree/main/robotics_control_loop/v2_interprocess_shared_memory
+The full example is here:
+**[v2_interprocess_shared_memory](https://github.com/alexaibio/multitasking_python/tree/main/robotics_control_loop/v2_interprocess_shared_memory)**
+
+
+## How Data Exchange via Shared Memory Is Implemented
+
+When we run a sensor generator (for example, a camera) in a separate process, we can use a shared queue to send its data from emitter to receiver. For interprocess communication, this would typically be a `multiprocessing.Queue`.
+
+Queues are convenient and safe for passing small messages but introduce significant serialization and copying overhead for large data streams such as camera frames.
+
+A much more efficient approach is to use a dedicated block of memory — **shared memory** — to exchange data directly between two processes (the sensor-emitter and the controller-receiver).
