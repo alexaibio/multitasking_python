@@ -71,7 +71,7 @@ class World:
     def should_stop(self) -> bool:
         return self._stop_event.is_set()
 
-    def run_simple(self, fg_loops, bg_loops):
+    def run_blocking_sleep(self, fg_loops, bg_loops):
         print(f"[world] is starting")
 
         ### Start background interprocess loops
@@ -118,7 +118,7 @@ class World:
             for pr in self.background_processes:
                 pr.join()
 
-    def run_optimal(self, fg_loops, bg_loops):
+    def run_cooperative(self, fg_loops, bg_loops):
         print(f"[world] is starting")
 
         ### Start background interprocess loops
@@ -244,5 +244,5 @@ if __name__ == "__main__":
 
 
     # START simulation - run sensor robotics_control_loop in background and controllers loop cooperatively
-    #world.run_simple(cooperative_loops, bg_loops)
-    world.run_optimal(cooperative_loops, bg_loops)
+    #world.run_blocking_sleep(cooperative_loops, bg_loops)
+    world.run_cooperative(cooperative_loops, bg_loops)

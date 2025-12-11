@@ -395,6 +395,7 @@ def _bg_wrapper_loop(sensor_gen_fn, stop_event, *args):
     try:
         for command in generator_fn:
             if isinstance(command, Sleep):
+                # NOTE: this is Blocking Sleep - not cooperative scheduling!
                 time.sleep(command.seconds)
             else:
                 raise ValueError(f'Unknown command: {command}')
